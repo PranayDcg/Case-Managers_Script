@@ -1,0 +1,6 @@
+logs/
+raw_files/
+__pycache__/
+*.lock
+slack_processed.json
+.env
