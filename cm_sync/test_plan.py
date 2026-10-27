@@ -91,12 +91,12 @@ rows2, st2 = S.build_plan([cl('D1', '5551110001', A), cl('D2', '5551110099', A),
 b2 = {}
 for r in rows2:
     b2.setdefault(r['action'], []).append(r)
-check('dup leads: keep SF-phone lead (no_change 11), extra 12 flagged not removed',
-      [r['lead_id'] for r in b2.get('no_change', [])] == ['11'] and [r['lead_id'] for r in b2.get('flag_duplicate_lead', [])] == ['12'])
-check('ambiguous file id flagged once and its leads are NOT removed', len(b2.get('flag_ambiguous', [])) == 1
-      and not any(r['lead_id'] in ('13', '14') for r in b2.get('remove', [])))
-check('NSF client in a CM list is removed with an NSF reason',
-      [r['lead_id'] for r in b2.get('remove', [])] == ['15'] and b2['remove'][0]['reason'].startswith('NSF'))
+rem2 = {r['lead_id']: r['reason'] for r in b2.get('remove', [])}
+check('dup leads: keep SF-phone lead 11 (no change), extra 12 removed as duplicate',
+      [r['lead_id'] for r in b2.get('no_change', [])] == ['11'] and rem2.get('12', '').startswith('duplicate'))
+check('no lead has the SF phone: keep oldest 13 and give it the SF phone (SF is truth), remove 14',
+      [r['lead_id'] for r in b2.get('update_phone', [])] == ['13'] and rem2.get('14', '').startswith('duplicate'))
+check('NSF switch ON: NSF client in a CM list is removed with an NSF reason', rem2.get('15', '').startswith('NSF'))
 
 # ---- scenario 2b: same client + same phone in the OLD campaign (lower id) and the RIGHT campaign ----
 state2b = {'4135': {'active_list': {'id': '100'}, 'leads': [ld(31, '100', '5553330001', 'X1')]},
@@ -114,8 +114,15 @@ state3 = {'4135': {'active_list': {'id': '100'}, 'leads': [ld(21, '100', '555222
           '4999': {'active_list': {'id': '200'}, 'leads': []}}
 rows3, _ = S.build_plan([cl('H2', '5552220001', B), cl('H1', '5552220001', A)], state3, cmmap)   # H2 listed first on purpose
 b3 = {r['action']: r for r in rows3}
-check('shared phone: first client matched, second flagged (not added)',
-      b3.get('no_change', {}).get('file') == 'H1' and b3.get('flag_shared_phone', {}).get('file') == 'H2' and 'add' not in b3)
+check('shared phone: both are clients: H1 matched, H2 added to its own CM',
+      b3.get('no_change', {}).get('file') == 'H1' and b3.get('add', {}).get('file') == 'H2' and 'shared' in b3['add']['reason'])
+
+# ---- scenario 4: moved client whose number also changed gets a move AND a phone update ----
+state4 = {'4135': {'active_list': {'id': '100'}, 'leads': [ld(41, '100', '5554440001', 'M1')]},
+          '4999': {'active_list': {'id': '200'}, 'leads': []}}
+rows4, _ = S.build_plan([cl('M1', '5554440099', B)], state4, cmmap)
+check('moved + new number: move then update_phone on the same lead',
+      [(r['action'], r['lead_id']) for r in rows4] == [('move', '41'), ('update_phone', '41')])
 
 # writes are blocked unless --apply
 class Fake(S.Convoso):

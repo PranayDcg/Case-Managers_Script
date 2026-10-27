@@ -24,7 +24,9 @@ Kalyssa's new clients missing. Case managers get reassigned about 130 times a we
 | **Cancelled** | The lead comes off dialing (moved to an inactive list in its campaign) |
 | **DNC** | **Always respected.** A DNC'd client is never added, and nothing is ever removed from DNC |
 | **Convoso setup** | Unchanged: one campaign per CM, and its current active list. Nothing new is created |
-| **Phone numbers** | Taken from SF `Mobile`, else `Phone`. Placeholder numbers (e.g. 949-xxx-1111) are ignored. Phone **updates are report-only** for now |
+| **Phone numbers** | **Salesforce is the source of truth.** Taken from SF `Mobile`, else `Phone`. When SF has a different number, the same Convoso lead gets the SF number (history kept). Placeholders are never used: numbers like 949-xxx-1111 (2 or fewer distinct digits) and any number shared by 3+ clients (office line). Without a real SF number, Convoso's number is left as is |
+| **Duplicate leads** | One client = one lead. If Convoso has 2+ leads for a client, the one with the SF number (else the oldest, in the right campaign) is kept; the others come off dialing |
+| **Shared number** | Two clients with the same number in SF are both clients, so each goes to their own CM |
 | **Weekends** | Skipped |
 
 ## 3. What happens every weekday
@@ -46,12 +48,9 @@ Kalyssa's new clients missing. Case managers get reassigned about 130 times a we
 | `new` | Client just reached Contract Signed (or has no lead yet), added to their CM's campaign |
 | `moved in` / `moved out` | Eli reassigned the client. The same lead moved between the two CMs' campaigns |
 | `removed` | Cancelled client (or a duplicate copy of a client) taken off dialing |
-| `on campaign DNC, not added` | Client is on that campaign's DNC. **Kept off on purpose** |
-| `ambiguous match` | Convoso has 2 leads for the client and neither has the SF number. A person checks the right number in SF |
-| `duplicate lead, different phone` | Convoso has 2 leads for the client with different numbers. A person removes the wrong one |
-| `phone shared by two clients` | Two clients have the same number in SF (shared line or typo). A person decides |
+| `🔒 on DNC: kept off` | Client is on that campaign's DNC. **Kept off on purpose** |
+| `phone updated` | SF had a different number; the lead now has the SF number |
 | `no phone in Salesforce` | Add a phone in SF; the next run picks it up |
-| `phone updates are report-only` | SF and Convoso numbers differ. Listed, not changed (see section 9) |
 | `case manager has no campaign` | A new CM in SF without a Convoso campaign. Add them to `cm_map.json` |
 
 ## 4. Slack commands (type in `#cm-uploads`; anyone can use them)
@@ -122,13 +121,14 @@ Daniela Ortiz (4989) has a Convoso campaign but no clients in SF, so it's not in
 - **Lock all live changes:** delete `APPLY_VERIFIED`. Plans still post, and nothing is written.
 - **Add a new case manager:** create their Convoso campaign, then add `"<SF user id>": {"name": "...", "campaign_id": "..."}` to `cm_map.json`, then restart.
 - **Retire a case manager:** add `"retired": true` to their entry; their leads move to the new CMs or come off dialing.
-- **Turn phone updates on:** set `UPDATE_PHONES = True` in `cm_sf_sync.py` (after reviewing the listed ones), then restart.
+- **Turn phone updates off:** set `UPDATE_PHONES = False` in `cm_sf_sync.py`, then restart (differences are then only listed).
 - **Check health:** `python -I C:\Users\PranaySavva\savva-team\bus\savva.py fleet` → `cm sync UP`.
 
 ## 9. Lessons and gotchas (don't relearn these)
 - **The old Lead Track file's columns 5–6 (Opp ID, Case Manager_C) are misaligned with its rows.** Never use them.
 - **Some SF `Mobile__c` values are placeholders** (949-xxx-1111, -8888, -6666). The real number is in `Phone__c`. During the
-  one-lead test this overwrote a real, already-dialed number. It was reverted at once, and now placeholders are ignored and phone updates are report-only.
+  one-lead test this overwrote a real, already-dialed number (reverted at once). Placeholders are now ignored, including any number on
+  3+ clients (three clients all had the same 949-xxx-6677).
 - The Convoso custom field `file` comes back from the API as **`field_43`** (`client_name` = field_19, `case_manager` = field_20).
 - The old weekly upload made **a new lead for the same client every week**, so call history reset weekly. The sync keeps one lead per client.
 - `leads/update` with a `list_id` in **another campaign** moves the lead and keeps its id and call history (proven 10/27).
@@ -142,7 +142,7 @@ Daniela Ortiz (4989) has a Convoso campaign but no clients in SF, so it's not in
 | 2026-10-27 | Removed leads go to the campaign's newest inactive list older than its active list |
 | 2026-10-27 | DNC always respected; DNC'd clients stay off |
 | 2026-10-27 | 5 PM plan with Socket Mode buttons, anyone can press, auto-sync at 6 PM if nobody rejects |
-| 2026-10-27 | Phone updates report-only until reviewed (placeholder-number incident) |
+| 2026-10-27 | SF is the source of truth for phones; placeholder and shared office numbers never used. Duplicate leads: keep one |
 | 2026-10-27 | Watchdog in the savva pinger; alerts by Slack DM |
 
 ## 11. Open items

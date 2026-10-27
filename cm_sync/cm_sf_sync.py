@@ -33,8 +33,9 @@ HERE = Path(__file__).resolve().parent
 CLIENT_STAGES = ('Contract Signed', 'Enrolled', 'Fees Done', 'NSF')
 EXCLUDE_NSF = False                # NSF/EFT clients stay with their CM (Pranay, 2026-10-27)
 NSF_LISTS = ('12793', '12791')     # NSF LT / GT (see Convoso docs/ARCHITECTURE.md)
+SHARED_PLACEHOLDER = 3             # a phone on this many SF clients is an office/placeholder number, never used
 MAX_CHANGES = 100                  # --apply refuses above this without --force
-UPDATE_PHONES = False              # phone changes are listed, not applied, until reviewed (2026-10-27: a placeholder SF number nearly overwrote a real one)
+UPDATE_PHONES = True               # SF is the source of truth for phones (Pranay 2026-10-27). Placeholder SF numbers are never used (looks_fake)
 REMOVE_DEST = {}                   # campaign_id -> inactive list_id. EMPTY ON PURPOSE: open decision (see REPORT.md)
 FILE_FIELDS = ('file', 'field_43')  # Convoso lead keys that hold the Leadtrac file number
 CONVOSO_PAGE = 100
@@ -156,6 +157,15 @@ def pull_sf_clients(sf):
             'stage': r.get('StageName') or '', 'cm_id': r.get('Case_Manager__c'), 'cm_name': cmr,
             'phones': {x for x in (mobile, phone) if x},
         })
+    # A number on 3+ different clients is an office/placeholder number, not the client's (2026-10-27: three clients all had
+    # the same 949-xxx-6677). Never use it; fall back to the client's other SF number if there is one.
+    used = Counter(n for c in clients for n in c['phones'])
+    shared = {n for n, k in used.items() if k >= SHARED_PLACEHOLDER}
+    for c in clients:
+        if c['phones'] & shared:
+            c['phones'] -= shared
+            c['phone'] = next(iter(sorted(c['phones'])), '') if c['phone'] in shared else c['phone']
+            c['placeholder_dropped'] = True
     return clients
 
 
@@ -367,34 +377,23 @@ def build_plan(clients, state, cmmap, nsf_phones=frozenset(), exclude_nsf=EXCLUD
         if len(cands) == 1:
             lead, how = cands[0], 'file'
         elif len(cands) > 1:
-            # Several Convoso leads carry this file id (duplicate rows in an old file, co-applicant phones...).
-            # Keep the one whose phone equals SF's; the others are flagged for a human, NEVER auto-removed.
-            # keeper = the lead with the SF phone, preferring the one already in the right campaign, then the oldest.
-            same_phone = sorted([l for l in cands if l['_phone'] == c['phone']],
-                                key=lambda l: (0 if l['_campaign'] == to_camp else 1, int(str(l.get('id') or 0) or 0)))
-            if same_phone:
-                lead, how = same_phone[0], 'file+phone'
-                for extra in cands:
-                    if extra is lead:
-                        continue
-                    used_lead_ids.add(id(extra))
-                    xk = dict(lead_id=str(extra.get('id') or ''), camp_from=extra['_campaign'],
-                              cm_from=camp_name[extra['_campaign']], cm_to=cm['name'], camp_to=to_camp,
-                              file=c['file'], phone_masked=mask(extra['_phone']), stage=c['stage'], name=c['name'])
-                    if extra['_phone'] == c['phone']:
-                        # same client AND same phone twice: a true duplicate, dialed from two campaigns. Remove the extra.
-                        row('remove', 'duplicate: same file id and phone as lead %s (kept)' % (lead.get('id') or ''),
-                            target_list=str(REMOVE_DEST.get(extra['_campaign'], '')),
-                            blocked='' if REMOVE_DEST.get(extra['_campaign']) else 'remove destination list not decided', **xk)
-                    else:
-                        row('flag_duplicate_lead', 'file id %s has %d Convoso leads; this one has a different phone, left untouched'
-                            % (c['file'], len(cands)), **xk)
-            else:
-                for extra in cands:
-                    used_lead_ids.add(id(extra))
-                row('flag_ambiguous', 'file id %s matches %d Convoso leads and none has the SF phone' % (c['file'], len(cands)),
-                    cm_to=cm['name'], camp_to=to_camp, **base)
-                continue
+            # Several Convoso leads carry this file id. One client = one lead: keep one, take the others off dialing.
+            # keeper = a lead that already has an SF number, else any; the one in the right campaign first, then the oldest.
+            # The keeper then gets the SF phone below (SF is the source of truth), so its call history is kept.
+            keyf = lambda l: (0 if l['_phone'] in c.get('phones', {c['phone']}) else 1,
+                              0 if l['_campaign'] == to_camp else 1, int(str(l.get('id') or 0) or 0))
+            lead = sorted(cands, key=keyf)[0]
+            how = 'file+phone' if lead['_phone'] in c.get('phones', {c['phone']}) else 'file (kept 1 of %d)' % len(cands)
+            for extra in cands:
+                if extra is lead:
+                    continue
+                used_lead_ids.add(id(extra))
+                xk = dict(lead_id=str(extra.get('id') or ''), camp_from=extra['_campaign'],
+                          cm_from=camp_name[extra['_campaign']], cm_to=cm['name'], camp_to=to_camp,
+                          file=c['file'], phone_masked=mask(extra['_phone']), stage=c['stage'], name=c['name'])
+                row('remove', 'duplicate: client has %d Convoso leads, kept lead %s' % (len(cands), lead.get('id') or ''),
+                    target_list=str(REMOVE_DEST.get(extra['_campaign'], '')),
+                    blocked='' if REMOVE_DEST.get(extra['_campaign']) else 'remove destination list not decided', **xk)
         if lead is None and c['phone']:
             pc = [l for l in conv_by_phone.get(c['phone'], []) if id(l) not in used_lead_ids]
             if len(pc) == 1:
@@ -413,14 +412,10 @@ def build_plan(clients, state, cmmap, nsf_phones=frozenset(), exclude_nsf=EXCLUD
                 row('flag_no_phone', 'SF client has no usable Mobile/Phone and no file match in Convoso',
                     cm_to=cm['name'], camp_to=to_camp, **base)
                 continue
-            if conv_by_phone.get(c['phone']):
-                # this phone already belongs to a lead in a CM active list that another SF client claimed (household /
-                # two files, one phone). Adding would make Convoso dial the same number twice, so a human decides.
-                row('flag_shared_phone', 'phone already on a lead (file %s) in a CM active list claimed by another client'
-                    % (conv_by_phone[c['phone']][0]['_file'] or '?'), cm_to=cm['name'], camp_to=to_camp, **base)
-                continue
+            shared = conv_by_phone.get(c['phone'])   # SF says two clients share this number: both are clients (Pranay 2026-10-27)
             blocked = '' if to_list else 'no active list in campaign %s' % to_camp
-            row('add', 'new client, no lead in any CM active list', cm_to=cm['name'], camp_to=to_camp,
+            row('add', 'new client, no lead in any CM active list' + ('; phone shared with file %s' % (shared[0]['_file'] or '?')
+                                                                         if shared else ''), cm_to=cm['name'], camp_to=to_camp,
                 target_list=str(to_list or ''), blocked=blocked, **base)
             continue
 
@@ -434,10 +429,13 @@ def build_plan(clients, state, cmmap, nsf_phones=frozenset(), exclude_nsf=EXCLUD
         cur_cm = camp_name[cur_camp]
         common = dict(lead_id=lid, cm_from=cur_cm, cm_to=cm['name'], camp_from=cur_camp, camp_to=to_camp, **base)
 
+        phone_differs = bool(c['phone'] and lead['_phone'] not in c.get('phones', {c['phone']}))
         if cur_camp != to_camp:
             blocked = '' if to_list else 'no active list in campaign %s' % to_camp
             row('move', 'case manager changed (%s)' % how, target_list=str(to_list or ''), blocked=blocked, **common)
-        elif c['phone'] and lead['_phone'] and lead['_phone'] not in c.get('phones', {c['phone']}):
+            if phone_differs:
+                row('update_phone', 'SF phone differs from Convoso lead (%s)' % how, **common)
+        elif phone_differs:
             # only when Convoso's number is NONE of the client's SF numbers (Mobile or Phone)
             row('update_phone', 'SF phone differs from Convoso lead (%s)' % how, **common)
         else:
