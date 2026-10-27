@@ -3,7 +3,8 @@
 Keeps every **case manager's Convoso campaign** matching **Salesforce**, every weekday, by itself.
 It replaces the weekly Lead Track file that back office used to drop in `#cm-uploads`.
 
-- **Live since:** 2026-10-27 (first sync approved by Pranay at 5:17 PM).
+- **Live since:** 2026-10-27. First sync approved by Pranay at 5:17 PM and done at 5:22 PM: **110 added, 134 moved,
+  163 removed, 1 failed** (Convoso rejected an invalid SF phone), out of 408 planned. Result and Asana report in `#cm-uploads`.
 - **Built by:** manager savva 2, Savva team. Dry-run build T-0012 (worker 1), QA T-0013 (worker 4), one-lead live test.
 - **Owner:** Pranay. **Data owner:** Eli (head of CMs), who keeps case managers right in Salesforce.
 
