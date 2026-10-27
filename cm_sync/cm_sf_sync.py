@@ -46,12 +46,13 @@ WRITE_ENDPOINTS = {'/v1/leads/insert', '/v1/leads/update', '/v1/leads/delete',
                    '/v1/lists/insert', '/v1/lists/update', '/v1/dnc/insert', '/v1/dnc/delete'}
 ALLOW_WRITES = False
 
-SOQL = ("SELECT Id, Leadtrac_File_ID__c, Account.Name, Mobile__c, Phone__c, StageName, "
-        "Case_Manager__c, Case_Manager__r.Name FROM Opportunity "
+SOQL = ("SELECT Id, Name, Leadtrac_File_ID__c, AccountId, Account.Name, Mobile__c, Phone__c, StageName, "
+        "Case_Manager__c, Case_Manager__r.Name, Owner.Name, CreatedBy.Name, CreatedDate FROM Opportunity "
         "WHERE Case_Manager__c != null AND StageName IN (" +
         ",".join("'%s'" % s for s in CLIENT_STAGES) + ")")
 
 log = logging.getLogger('cm_sf_sync')
+LAST_CLIENTS = []   # SF clients of the last compute(), with 'notes' for the issue report
 
 
 # ── Secrets: loaded at runtime from the existing files, never printed or copied ──
@@ -156,30 +157,62 @@ def pull_sf_clients(sf):
             'phone': mobile or phone, 'phone_alt': phone if mobile and phone and phone != mobile else '',
             'stage': r.get('StageName') or '', 'cm_id': r.get('Case_Manager__c'), 'cm_name': cmr,
             'phones': {x for x in (mobile, phone) if x},
+            # context for the issue report (masked phones only)
+            'opp_name': r.get('Name') or '', 'account_id': r.get('AccountId') or '',
+            'owner': (r.get('Owner') or {}).get('Name') or '', 'created_by': (r.get('CreatedBy') or {}).get('Name') or '',
+            'created': (r.get('CreatedDate') or '')[:10],
+            'raw_phones': {'Mobile': clean_phone(r.get('Mobile__c')), 'Phone': clean_phone(r.get('Phone__c'))},
+            'notes': [],
         })
     # A number on 3+ different clients is an office/placeholder number, not the client's (2026-10-27: three clients all had
     # the same 949-xxx-6677). Never use it; fall back to the client's other SF number if there is one.
-    used = Counter(n for c in clients for n in c['phones'])
+    # counted per COMPANY (account), not per deal: one company with 3 deals all on its own number is fine (Jp & Son, 10/27)
+    used = Counter(n for n, _acct in {(n, c['account_id'] or c['file']) for c in clients for n in c['phones']})
     shared = {n for n, k in used.items() if k >= SHARED_PLACEHOLDER}
     # Never dial a staff member: drop any number that belongs to a Salesforce user (case managers and all staff).
     # 2026-10-27: one client had a staff member's number in both phone fields.
-    shared |= staff_numbers(sf)
+    staff = staff_numbers(sf)
+    shared |= set(staff)
     for c in clients:
+        for fld, n in c['raw_phones'].items():
+            if not n:
+                continue
+            if n in staff:
+                c['notes'].append('%s %s is a STAFF number (%s): not used' % (fld, mask_area(n), staff[n]))
+            elif looks_fake(n):
+                c['notes'].append('%s %s is a placeholder number: not used' % (fld, mask_area(n)))
+            elif used.get(n, 0) >= SHARED_PLACEHOLDER:
+                c['notes'].append('%s %s is on %d different companies (office/placeholder line): not used' % (fld, mask_area(n), used[n]))
         if c['phones'] & shared:
             c['phones'] -= shared
             c['phone'] = next(iter(sorted(c['phones'])), '') if c['phone'] in shared else c['phone']
             c['placeholder_dropped'] = True
+    # several client deals on one account = possibly a duplicate deal (the client may be dialed twice)
+    by_acct = defaultdict(list)
+    for c in clients:
+        if c['account_id']:
+            by_acct[c['account_id']].append(c)
+    for group in by_acct.values():
+        if len(group) > 1:
+            for c in group:
+                others = ['%s (file %s, %s, CM %s, created %s by %s)' % (o['opp_name'], o['file'] or '-', o['stage'], o['cm_name'],
+                                                                          o['created'], o['created_by']) for o in group if o is not c]
+                c['notes'].append('same account has %d client deals: also %s' % (len(group), '; '.join(others)))
     return clients
 
 
+def mask_area(n):
+    return '%s-***-%s' % (n[:3], n[-4:]) if n else ''
+
+
 def staff_numbers(sf):
-    """Every phone on a Salesforce user record (active or not). These are never dialed as a client."""
-    out = set()
-    for u in sf.query("SELECT Phone, MobilePhone, Fax FROM User"):
+    """Every phone on a Salesforce user record (active or not) -> user name. These are never dialed as a client."""
+    out = {}
+    for u in sf.query("SELECT Name, Phone, MobilePhone, Fax FROM User"):
         for k in ('Phone', 'MobilePhone', 'Fax'):
             n = clean_phone(u.get(k))
             if n:
-                out.add(n)
+                out.setdefault(n, u.get('Name') or 'a Salesforce user')
     if not out:
         raise RuntimeError('could not read staff phone numbers from Salesforce (refusing to plan without the staff guard)')
     return out
@@ -615,8 +648,10 @@ def compute(apply=False):
     full phone carry it in '_phone_full' (memory only, never written to disk)."""
     cmmap = json.loads((HERE / 'cm_map.json').read_text(encoding='utf-8'))
 
+    global LAST_CLIENTS
     sf = SF()
     clients = pull_sf_clients(sf)
+    LAST_CLIENTS = clients
     log.info('SF clients (stages %s, CM set): %d', ', '.join(CLIENT_STAGES), len(clients))
 
     cv = Convoso()

@@ -191,7 +191,8 @@ def summary_text(title, rows, results=None):
         ok = lambda a: results.get(a + '_ok', 0)
         fails = sum(v for k, v in results.items() if k.endswith('_fail'))
         lines += ['──────────────', f"Done: {ok('add')} new · {ok('move')} moved · {ok('remove')} removed"
-                  + (f' · *{fails} failed (see thread)*' if fails else ' · 0 failed')]
+                  + (f" · {ok('update_phone')} phones updated" if ok('update_phone') else '')
+                  + (f' · *{fails} failed*' if fails else ' · 0 failed')]
         if results.get('stopped_before'):
             lines.append(f"🛑 Stopped by `sync stop`: {results['stopped_before']} changes NOT done")
     dnc = tot['flag_dnc']
@@ -199,10 +200,10 @@ def summary_text(title, rows, results=None):
         lines.append(f'🔒 {dnc} on DNC: kept off, as intended')
     people = sum(n for k, n in tot.items() if k.startswith('flag') and k != 'flag_dnc')
     if people:
-        lines.append(f'⚠️ {people} need a person (wrong, missing or duplicate phone): listed in the thread')
+        lines.append(f'⚠️ {people} with a wrong or missing phone: not changed')
     phones = sum(1 for r in rows if r['action'] == 'blocked' and r.get('reason', '').startswith('SF phone differs'))
     if phones:
-        lines.append(f'📞 {phones} phone numbers differ between Salesforce and Convoso: not changed (report-only), listed in the thread')
+        lines.append(f'📞 {phones} phone numbers differ between Salesforce and Convoso: not changed (report-only)')
     other = [r for r in rows if r['action'] == 'blocked' and not r.get('reason', '').startswith('SF phone differs')]
     if other:
         lines.append(f'⚠️ {len(other)} changes blocked: ' + '; '.join(sorted({r["blocked"] for r in other}))[:300])
@@ -285,6 +286,89 @@ def asana_report(title, text):
         return None
 
 
+# ── issues -> Savva team (worker 1 investigates, manager savva 2 tells Pranay) ──
+SAVVA = Path(r'C:\Users\PranaySavva\savva-team')
+ISSUES_DIR = SAVVA / 'tasks' / 'cm-sync-issues'
+ISSUE_REPEAT_DAYS = 7          # an unresolved issue is sent again after a week, not every day
+
+
+def collect_issues(rows, failed_lines=()):
+    """One entry per client that needs a person. DNC is not an issue (kept off on purpose)."""
+    why = {'flag_no_phone': 'no usable phone in Salesforce', 'flag_unmapped_cm': 'case manager has no Convoso campaign',
+           'flag_ambiguous': 'Convoso leads do not match the SF phone', 'flag_duplicate_lead': 'duplicate Convoso lead',
+           'flag_shared_phone': 'phone shared with another client'}
+    by_file = {c['file']: c for c in S.LAST_CLIENTS if c.get('file')}
+    out = {}
+    def add(file, name, cm, problem):
+        key = file or name
+        e = out.setdefault(key, {'file': file, 'client': name, 'cm': cm, 'problems': [], 'context': []})
+        if problem not in e['problems']:
+            e['problems'].append(problem)
+    for line in failed_lines:
+        m = re.match(r'(\w+) (.*) \(file ([^)]*)\): (.*)', line)
+        if m:
+            add(m.group(3), m.group(2), by_file.get(m.group(3), {}).get('cm_name', ''), f'{m.group(1)} FAILED in Convoso: {m.group(4)}')
+    for r in rows:
+        if r['action'].startswith('flag') and r['action'] != 'flag_dnc':
+            add(r['file'], r['name'], r['cm_to'] or r['cm_from'], why.get(r['action'], r['reason']))
+    dup_accounts = set()
+    for c in S.LAST_CLIENTS:
+        for note in c.get('notes', []):
+            if note.startswith('same account'):
+                if c.get('account_id') in dup_accounts:
+                    continue                      # one entry per company, not one per deal
+                dup_accounts.add(c.get('account_id'))
+            add(c['file'], c['name'], c['cm_name'], note)
+    for key, e in out.items():
+        c = by_file.get(e['file'])
+        if c:
+            e['context'] = [f"deal: {c['opp_name']} | stage {c['stage']} | CM {c['cm_name']} | owner {c['owner']} | "
+                            f"created {c['created']} by {c['created_by']}",
+                            'SF phones: ' + ', '.join(f"{k} {S.mask_area(v) or '(empty)'}" for k, v in c['raw_phones'].items())]
+    return list(out.values())
+
+
+def send_issues(rows, failed_lines=()):
+    """Writes today's NEW issues to savva-team\\tasks\\cm-sync-issues\\<date>\\ and posts a task for worker 1.
+    Returns how many were sent (0 = nothing new)."""
+    issues = collect_issues(rows, failed_lines)
+    today = datetime.now().strftime('%Y-%m-%d')
+    seen_file = ISSUES_DIR / '_seen.json'      # its own file, so no other writer of state.json can overwrite it
+    try:
+        seen = json.loads(seen_file.read_text(encoding='utf-8'))
+    except Exception:
+        seen = {}
+    fresh = []
+    for e in issues:
+        key = f"{e['file'] or e['client']}|{'|'.join(sorted(e['problems']))}"
+        last = seen.get(key)
+        if last and (datetime.now() - datetime.fromisoformat(last)).days < ISSUE_REPEAT_DAYS:
+            continue
+        seen[key] = today
+        fresh.append(e)
+    ISSUES_DIR.mkdir(parents=True, exist_ok=True)
+    seen_file.write_text(json.dumps({k: v for k, v in seen.items() if (datetime.now() - datetime.fromisoformat(v)).days < 30},
+                                    indent=0), encoding='utf-8')
+    if not fresh:
+        return 0
+    day = ISSUES_DIR / today
+    day.mkdir(parents=True, exist_ok=True)
+    md = [f'# CM sync issues {today}', '', f'{len(fresh)} client(s). Phones are masked. Source: CM Salesforce Sync, {datetime.now():%H:%M}.', '']
+    for i, e in enumerate(fresh, 1):
+        md += [f"## {i}. {e['client']} (file {e['file'] or '-'}), CM {e['cm'] or '-'}"] + [f'- **Problem:** {x}' for x in e['problems']] \
+              + [f'- {x}' for x in e['context']] + ['']
+    (day / 'issues.md').write_text('\n'.join(md), encoding='utf-8')
+    (day / 'issues.json').write_text(json.dumps(fresh, indent=1), encoding='utf-8')
+    sys.path.insert(0, str(SAVVA / 'bus'))
+    from savva_bus import Bus
+    tid, target = Bus().post_task('manager savva 2', 'convoso', f'CM sync issues {today}: {len(fresh)} client(s)',
+                                  f'Investigate the CM sync issues in tasks\\cm-sync-issues\\{today}\\issues.md. '
+                                  'Follow PRD.md / SDD.md in brief_path. Write REPORT.md in the same dated folder.',
+                                  priority=2, worker='agent-worker-savva-1', brief_path='tasks\\cm-sync-issues')
+    log.info('sent %d issue(s) to the Savva team as %s', len(fresh), tid)
+    return len(fresh)
+
+
 # ── the jobs ───────────────────────────────────────────────────────────────
 SANITY_DROP = 0.6   # refuse if SF clients or Convoso leads fell below 60% of the last good run (QA B2)
 
@@ -310,9 +394,6 @@ def job_preview(label='Preview'):
     title = f"🔎 CM Sync {label} — {datetime.now():%a %m/%d %I:%M %p} (planned, nothing changed yet)"
     ts = say(summary_text(title, rows) + (f'\n_{n} changes planned. ' + (
         f'Over {S.MAX_CHANGES}: the run will wait for `sync proceed`._' if n > S.MAX_CHANGES else 'Runs automatically at 5:00 PM._')))
-    for part in (attention_text(rows), detail_text(rows)):
-        if part:
-            say(part, thread=ts)
 
 
 def job_run(trigger, wait_for_buttons=False):
@@ -355,9 +436,6 @@ def job_run(trigger, wait_for_buttons=False):
             ts = say_buttons(text, [('✅ Sync now', 'cm_sync_proceed', 'primary'), ('❌ Reject', 'cm_sync_cancel', 'danger')])
         else:
             ts = say(text + 'Type `sync proceed` to sync now or `sync cancel` to reject.')
-        for part in (attention_text(rows), detail_text(rows)):
-            if part:
-                say(part, thread=ts)
         _hist(trigger, f'waiting ({n}), auto at 6 PM', Counter())
         return
     _apply(rows, cv, trigger)
@@ -397,11 +475,18 @@ def _apply(rows, cv, trigger):
     if results.get('stopped_before'):
         title = f"🛑 CM Sync STOPPED — {datetime.now():%a %m/%d %I:%M %p}"
     text = summary_text(title, rows, results)
-    url = asana_report(f"CM Sync — {datetime.now():%m/%d/%Y}", text + '\n\n' + detail_text(rows))
-    ts = say(text + (f'\n📝 Asana report: {url}' if url else ''))
-    for part in (attention_text(rows, _failed_lines(run_id)[:60]), detail_text(rows)):
-        if part:
-            say(part, thread=ts)
+    url = asana_report(f"CM Sync — {datetime.now():%m/%d/%Y}", text + '\n\n' + attention_text(rows, _failed_lines(run_id))
+                       + '\n\n' + detail_text(rows))
+    try:
+        sent = send_issues(rows, _failed_lines(run_id))
+    except Exception as e:                       # the sync itself worked; never fail the report because of this
+        log.error('could not send issues to the Savva team: %s', e)
+        sent = -1
+    if sent > 0:
+        text += f'\n🧑‍🔧 {sent} issue(s) sent to the Savva team to investigate.'
+    elif sent < 0:
+        text += '\n⚠️ Could not hand the issues to the Savva team (see service.log).'
+    say(text + (f'\n📝 Full list: {url}' if url else ''))
     _hist(trigger, 'stopped' if results.get('stopped_before') else 'applied', results)
 
 

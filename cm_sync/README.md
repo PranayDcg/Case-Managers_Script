@@ -42,6 +42,13 @@ Kalyssa's new clients missing. Case managers get reassigned about 130 times a we
 - **PC asleep or off at 5 PM:** it runs when the PC is back (until 7 PM) and still waits at least 30 min for a Reject.
 - **Nothing to change:** "✅ everything already matches Salesforce".
 
+### Issues go to the Savva team, not to Slack
+Messages in `#cm-uploads` have **no thread replies**. After each sync, every client that needs a person (wrong, missing,
+staff or placeholder phone; duplicate deals; failed Convoso writes) is written to
+`savva-team	asks\cm-sync-issues\<date>\issues.md` and handed to **Savva worker 1** as a bus task. The worker writes
+`REPORT.md` (root causes, who fixes what), and manager savva 2 tells Pranay. The same issue is re-sent only after 7 days
+(`_seen.json`). The Slack summary just says "N issue(s) sent to the Savva team". The full list of changes is in the Asana report.
+
 ### Reading the summary
 | Line | Meaning |
 |---|---|

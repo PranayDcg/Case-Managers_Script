@@ -95,6 +95,14 @@ check('staff number never used (falls back to the other SF number)', got['S1'] =
 check('client with only a staff number gets no phone', got['S2'] == '')
 check('number on 3+ clients never used', got['O1'] == '' and got['O3'] == '2125550100')
 
+class FakeSF2(FakeSF):
+    def query(self, q):
+        if 'FROM User' in q:
+            return super().query(q)
+        return [dict(r, AccountId='ACC1') for r in super().query(q) if r['Id'].startswith('O')]   # same company, 3 deals
+got2 = {c['file']: c['phone'] for c in S.pull_sf_clients(FakeSF2())}
+check('one company with 3 deals on its own number keeps it', got2['O1'] == '9495556677')
+
 # ---- scenario 2: duplicate leads for one file id, ambiguity, NSF lead left in a CM list ----
 state2 = {'4135': {'active_list': {'id': '100'}, 'leads': [
             ld(11, '100', '5551110001', 'D1'), ld(12, '100', '5551110002', 'D1'),   # same file, SF phone = ...01
