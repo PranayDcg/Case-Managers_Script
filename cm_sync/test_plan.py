@@ -80,6 +80,21 @@ st_p = {k: dict(v, leads=list(v['leads'])) for k, v in state.items()}
 rows_p, _ = S.build_plan([c_alt], st_p, cmmap)
 check('Convoso number = SF Phone__c is not a phone update', not any(r['action'] == 'update_phone' and r['file'] == 'P1' for r in rows_p))
 
+# ---- staff numbers and shared office lines are never used as a client's phone ----
+class FakeSF:
+    def query(self, q):
+        if 'FROM User' in q:
+            return [{'Phone': '(754) 555-2183', 'MobilePhone': None, 'Fax': None}]
+        rec = lambda f, mob, ph: {'Id': f, 'Leadtrac_File_ID__c': f, 'Account': {'Name': f}, 'Mobile__c': mob, 'Phone__c': ph,
+                                  'StageName': 'Enrolled', 'Case_Manager__c': A, 'Case_Manager__r': {'Name': 'x'}}
+        return [rec('S1', '7545552183', '3055550123'),                 # mobile = staff -> use the other number
+                rec('S2', '7545552183', None),                         # only a staff number -> no phone
+                rec('O1', '9495556677', None), rec('O2', '9495556677', None), rec('O3', '9495556677', '2125550100')]  # office line x3
+got = {c['file']: c['phone'] for c in S.pull_sf_clients(FakeSF())}
+check('staff number never used (falls back to the other SF number)', got['S1'] == '3055550123')
+check('client with only a staff number gets no phone', got['S2'] == '')
+check('number on 3+ clients never used', got['O1'] == '' and got['O3'] == '2125550100')
+
 # ---- scenario 2: duplicate leads for one file id, ambiguity, NSF lead left in a CM list ----
 state2 = {'4135': {'active_list': {'id': '100'}, 'leads': [
             ld(11, '100', '5551110001', 'D1'), ld(12, '100', '5551110002', 'D1'),   # same file, SF phone = ...01

@@ -24,7 +24,7 @@ Kalyssa's new clients missing. Case managers get reassigned about 130 times a we
 | **Cancelled** | The lead comes off dialing (moved to an inactive list in its campaign) |
 | **DNC** | **Always respected.** A DNC'd client is never added, and nothing is ever removed from DNC |
 | **Convoso setup** | Unchanged: one campaign per CM, and its current active list. Nothing new is created |
-| **Phone numbers** | **Salesforce is the source of truth.** Taken from SF `Mobile`, else `Phone`. When SF has a different number, the same Convoso lead gets the SF number (history kept). Placeholders are never used: numbers like 949-xxx-1111 (2 or fewer distinct digits) and any number shared by 3+ clients (office line). Without a real SF number, Convoso's number is left as is |
+| **Phone numbers** | **Salesforce is the source of truth.** Taken from SF `Mobile`, else `Phone`. When SF has a different number, the same Convoso lead gets the SF number (history kept). Placeholders are never used: numbers like 949-xxx-1111 (2 or fewer distinct digits) any number shared by 3+ clients (office line), and **any number of a Salesforce user (staff / case manager)**: we only ever dial the client. Without a real SF number, Convoso's number is left as is |
 | **Duplicate leads** | One client = one lead. If Convoso has 2+ leads for a client, the one with the SF number (else the oldest, in the right campaign) is kept; the others come off dialing |
 | **Shared number** | Two clients with the same number in SF are both clients, so each goes to their own CM |
 | **Weekends** | Skipped |
@@ -129,6 +129,8 @@ Daniela Ortiz (4989) has a Convoso campaign but no clients in SF, so it's not in
 - **Some SF `Mobile__c` values are placeholders** (949-xxx-1111, -8888, -6666). The real number is in `Phone__c`. During the
   one-lead test this overwrote a real, already-dialed number (reverted at once). Placeholders are now ignored, including any number on
   3+ clients (three clients all had the same 949-xxx-6677).
+- **A client record can hold a staff number.** One client had a staff member's number in both SF phone fields.
+  Every run now reads all SF user phones and never uses them for a client (and refuses to plan if it can't read them).
 - The Convoso custom field `file` comes back from the API as **`field_43`** (`client_name` = field_19, `case_manager` = field_20).
 - The old weekly upload made **a new lead for the same client every week**, so call history reset weekly. The sync keeps one lead per client.
 - `leads/update` with a `list_id` in **another campaign** moves the lead and keeps its id and call history (proven 10/27).

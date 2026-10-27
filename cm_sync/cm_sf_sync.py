@@ -161,12 +161,28 @@ def pull_sf_clients(sf):
     # the same 949-xxx-6677). Never use it; fall back to the client's other SF number if there is one.
     used = Counter(n for c in clients for n in c['phones'])
     shared = {n for n, k in used.items() if k >= SHARED_PLACEHOLDER}
+    # Never dial a staff member: drop any number that belongs to a Salesforce user (case managers and all staff).
+    # 2026-10-27: one client had a staff member's number in both phone fields.
+    shared |= staff_numbers(sf)
     for c in clients:
         if c['phones'] & shared:
             c['phones'] -= shared
             c['phone'] = next(iter(sorted(c['phones'])), '') if c['phone'] in shared else c['phone']
             c['placeholder_dropped'] = True
     return clients
+
+
+def staff_numbers(sf):
+    """Every phone on a Salesforce user record (active or not). These are never dialed as a client."""
+    out = set()
+    for u in sf.query("SELECT Phone, MobilePhone, Fax FROM User"):
+        for k in ('Phone', 'MobilePhone', 'Fax'):
+            n = clean_phone(u.get(k))
+            if n:
+                out.add(n)
+    if not out:
+        raise RuntimeError('could not read staff phone numbers from Salesforce (refusing to plan without the staff guard)')
+    return out
 
 
 def sf_lookup_by_file(sf, files):
