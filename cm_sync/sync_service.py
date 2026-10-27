@@ -185,48 +185,71 @@ def summary_text(title, rows, results=None):
             bits.append(f"{c['phone']} phone updated")
         lines.append(f'{cm} — ' + ', '.join(bits))
     tot = Counter(r['action'] for r in rows)
-    lines += ['──────────────',
-              f"Total: {tot['add']} new · {tot['move']} moved · {tot['remove']} removed · {tot['update_phone']} phone updated"]
-    if results is not None:
+    if results is None:
+        lines += ['──────────────', f"Total: {tot['add']} new · {tot['move']} moved · {tot['remove']} removed"]
+    else:
+        ok = lambda a: results.get(a + '_ok', 0)
         fails = sum(v for k, v in results.items() if k.endswith('_fail'))
-        skipped = sum(v for k, v in results.items() if 'skipped' in k)
-        lines[-1] += (f' · *{fails} failed*' if fails else ' · 0 failed') + (f' · {skipped} skipped' if skipped else '')
+        lines += ['──────────────', f"Done: {ok('add')} new · {ok('move')} moved · {ok('remove')} removed"
+                  + (f' · *{fails} failed (see thread)*' if fails else ' · 0 failed')]
         if results.get('stopped_before'):
             lines.append(f"🛑 Stopped by `sync stop`: {results['stopped_before']} changes NOT done")
-    flags = Counter(r['action'] for r in rows if r['action'].startswith('flag'))
-    if flags:
-        names = {'flag_dnc': 'on campaign DNC, not added', 'flag_unmapped_cm': 'case manager has no campaign',
-                 'flag_ambiguous': 'ambiguous match', 'flag_duplicate_lead': 'duplicate lead, different phone',
-                 'flag_shared_phone': 'phone shared by two clients', 'flag_no_phone': 'no phone in Salesforce'}
-        lines.append('⚠️ Needs a person: ' + '; '.join(f'{n} {names.get(k, k)}' for k, n in flags.items()) + ' (details in thread)')
-    blocked = [r for r in rows if r['action'] == 'blocked']
-    if blocked:
-        lines.append(f'⚠️ {len(blocked)} changes blocked: ' + '; '.join(sorted({r["blocked"] for r in blocked}))[:300])
+    dnc = tot['flag_dnc']
+    if dnc:
+        lines.append(f'🔒 {dnc} on DNC: kept off, as intended')
+    people = sum(n for k, n in tot.items() if k.startswith('flag') and k != 'flag_dnc')
+    if people:
+        lines.append(f'⚠️ {people} need a person (wrong, missing or duplicate phone): listed in the thread')
+    phones = sum(1 for r in rows if r['action'] == 'blocked' and r.get('reason', '').startswith('SF phone differs'))
+    if phones:
+        lines.append(f'📞 {phones} phone numbers differ between Salesforce and Convoso: not changed (report-only), listed in the thread')
+    other = [r for r in rows if r['action'] == 'blocked' and not r.get('reason', '').startswith('SF phone differs')]
+    if other:
+        lines.append(f'⚠️ {len(other)} changes blocked: ' + '; '.join(sorted({r["blocked"] for r in other}))[:300])
     return '\n'.join(lines)
 
 
+def attention_text(rows, failed_lines=()):
+    """Thread message 1: only what a person has to look at."""
+    out = []
+    if failed_lines:
+        out += ['*❌ Failed* (nothing else was affected)'] + [f'• {x}' for x in failed_lines] + ['']
+    why = {'flag_ambiguous': '2 leads in Convoso, neither has the SF phone', 'flag_duplicate_lead': 'extra Convoso lead with another phone',
+           'flag_shared_phone': 'same phone as another client', 'flag_no_phone': 'no phone in Salesforce',
+           'flag_unmapped_cm': 'case manager has no Convoso campaign'}
+    ppl = [r for r in rows if r['action'].startswith('flag') and r['action'] != 'flag_dnc']
+    if ppl:
+        out += ['*⚠️ Needs a person* (fix in Salesforce; the next run picks it up)']
+        out += [f"• {r['name'] or '?'} (file {r['file'] or '-'}), {r['cm_to'] or r['cm_from']}: {why.get(r['action'], r['reason'])}" for r in ppl]
+        out += ['']
+    ph = [r for r in rows if r['action'] == 'update_phone']
+    if ph:
+        out += ['*📞 Phone differs* (Salesforce vs Convoso, not changed)']
+        out += [f"• {r['name'] or '?'} (file {r['file'] or '-'}), {r['cm_to']}: SF number ends {r['phone_masked'][-4:]}" for r in ph]
+    return '\n'.join(out).strip()
+
+
 def detail_text(rows):
-    lab = {'add': 'NEW', 'move': 'MOVED', 'remove': 'REMOVED', 'update_phone': 'PHONE'}
-    out = ['Details:']
-    for a in S.APPLY_ORDER:
-        for r in rows:
-            if r['action'] != a:
-                continue
-            who = f"{r['name'] or '?'} (file {r['file'] or '-'})"
-            if a == 'move':
-                out.append(f"{lab[a]}  {who}: {r['cm_from']} → {r['cm_to']}")
-            elif a == 'remove':
-                out.append(f"{lab[a]}  {who} from {r['cm_from']}: {r['reason']}")
-            elif a == 'add':
-                out.append(f"{lab[a]}  {who} → {r['cm_to']} ({r['stage']})")
-            else:
-                out.append(f"{lab[a]}  {who} ({r['cm_to']}) ...{r['phone_masked'][-4:]}")
-            if r['blocked']:
-                out[-1] += f"  [BLOCKED: {r['blocked']}]"
+    """Thread message 2: every change, grouped per case manager, names only (dense)."""
+    per = defaultdict(lambda: defaultdict(list))
     for r in rows:
-        if r['action'].startswith('flag'):
-            out.append(f"CHECK  {r['name'] or '?'} (file {r['file'] or '-'}) {r['cm_to'] or r['cm_from']}: {r['reason']}")
-    return '\n'.join(out) if len(out) > 1 else ''
+        if r['blocked'] or r['action'] not in ('add', 'move', 'remove'):
+            continue
+        nm = r['name'] or r['file'] or '?'
+        if r['action'] == 'add':
+            per[r['cm_to']]['new'].append(nm)
+        elif r['action'] == 'move':
+            per[r['cm_to']][f"in from {r['cm_from']}"].append(nm)
+        else:
+            per[r['cm_from']]['removed (cancelled)' if 'Cancelled' in r['reason'] else 'removed (duplicate/other)'].append(nm)
+    if not per:
+        return ''
+    out = ['*All changes, by case manager* (`sync client <file#>` for one client)']
+    for cm in sorted(per, key=str.lower):
+        out.append(f'*{cm}*')
+        for k, names in per[cm].items():
+            out.append(f"  {k} ({len(names)}): " + ', '.join(names))
+    return '\n'.join(out)
 
 
 # ── tracking ───────────────────────────────────────────────────────────────
@@ -287,9 +310,9 @@ def job_preview(label='Preview'):
     title = f"🔎 CM Sync {label} — {datetime.now():%a %m/%d %I:%M %p} (planned, nothing changed yet)"
     ts = say(summary_text(title, rows) + (f'\n_{n} changes planned. ' + (
         f'Over {S.MAX_CHANGES}: the run will wait for `sync proceed`._' if n > S.MAX_CHANGES else 'Runs automatically at 5:00 PM._')))
-    d = detail_text(rows)
-    if d:
-        say(d, thread=ts)
+    for part in (attention_text(rows), detail_text(rows)):
+        if part:
+            say(part, thread=ts)
 
 
 def job_run(trigger, wait_for_buttons=False):
@@ -332,9 +355,9 @@ def job_run(trigger, wait_for_buttons=False):
             ts = say_buttons(text, [('✅ Sync now', 'cm_sync_proceed', 'primary'), ('❌ Reject', 'cm_sync_cancel', 'danger')])
         else:
             ts = say(text + 'Type `sync proceed` to sync now or `sync cancel` to reject.')
-        d = detail_text(rows)
-        if d:
-            say(d, thread=ts)
+        for part in (attention_text(rows), detail_text(rows)):
+            if part:
+                say(part, thread=ts)
         _hist(trigger, f'waiting ({n}), auto at 6 PM', Counter())
         return
     _apply(rows, cv, trigger)
@@ -376,12 +399,9 @@ def _apply(rows, cv, trigger):
     text = summary_text(title, rows, results)
     url = asana_report(f"CM Sync — {datetime.now():%m/%d/%Y}", text + '\n\n' + detail_text(rows))
     ts = say(text + (f'\n📝 Asana report: {url}' if url else ''))
-    failed_lines = _failed_lines(run_id)
-    if failed_lines:
-        say('❌ Failed changes (nothing else was affected):\n' + '\n'.join(failed_lines[:60]), thread=ts)
-    d = detail_text(rows)
-    if d:
-        say(d, thread=ts)
+    for part in (attention_text(rows, _failed_lines(run_id)[:60]), detail_text(rows)):
+        if part:
+            say(part, thread=ts)
     _hist(trigger, 'stopped' if results.get('stopped_before') else 'applied', results)
 
 
