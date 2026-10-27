@@ -34,14 +34,37 @@ ASANA_USER_GID    = '1210889312062695'  # Pranay
 CM_CAMPAIGNS = {
     'Alondra Alva':       '4135',
     'Alquinton Smith':    '4999',
-    'Asmeri Mix':         '4997',
+    'Kalyssa Acosta':     '4997',
     'Darrell Fair':       '4985',
     'Maximiliano Muller': '4991',
     'Eli Paredes':        '5003',
     'Patricia Tercier':   '5007',
     'Sammaurae Barr':     '4993',
     'Wanicka cassagnol':  '4995',
+    'Stefan Rivera':      '6181',
+    'Joshua Cardenas':    '6269',
+    'Ebonee Wright':      '6871',
 }
+
+
+def _norm_cm(name):
+    """Normalize a CM name for matching: lowercase + collapse internal whitespace + strip.
+    Makes the campaign lookup forgiving of casing/spacing drift in Oscar's file (e.g.
+    'Stefan Rivera' vs 'stefan rivera' vs 'Stefan  Rivera' all match). Routing only —
+    the original spelling is still what gets stored/displayed on the lead in Convoso."""
+    return re.sub(r'\s+', ' ', str(name)).strip().lower()
+
+
+# Normalized index of CM_CAMPAIGNS, built once. Keys today are all distinct after
+# normalization, so no collisions; if two ever collide, the later one wins (and that
+# would be a data problem to fix in CM_CAMPAIGNS, not here).
+_CM_CAMPAIGNS_NORM = {_norm_cm(k): v for k, v in CM_CAMPAIGNS.items()}
+
+
+def campaign_for_cm(cm_name):
+    """Case/space-insensitive lookup of a CM's campaign id. Returns the id or None."""
+    return _CM_CAMPAIGNS_NORM.get(_norm_cm(cm_name))
+
 
 log = logging.getLogger('cm_upload')
 
@@ -58,7 +81,11 @@ def clean_phone(phone):
     """Strip formatting, remove leading 1. Returns 10-digit string or ''."""
     if phone is None:
         return ''
-    digits = ''.join(c for c in str(phone) if c.isdigit())
+    phone = str(phone)
+    # Strip Slack tel: auto-link format: <tel:8433608471|(843) 360-8471>
+    if '<tel:' in phone:
+        phone = re.sub(r'<tel:([^|>]+)[^>]*>', r'\1', phone)
+    digits = ''.join(c for c in phone if c.isdigit())
     if len(digits) == 11 and digits.startswith('1'):
         digits = digits[1:]
     return digits if len(digits) == 10 else ''
@@ -139,7 +166,7 @@ def parse_file(filepath):
     cms = {}
     unmatched = []
     for cm_name, leads in sorted(cm_data.items()):
-        campaign_id = CM_CAMPAIGNS.get(cm_name)
+        campaign_id = campaign_for_cm(cm_name)  # case/space-insensitive match
         if not campaign_id:
             unmatched.append(cm_name)
         cms[cm_name] = {
@@ -200,8 +227,8 @@ def upload_all(summary):
         list_id = str(resp.get('data', {}).get('list_id') or resp.get('id', ''))
         log.info(f'Created list {list_id} for {cm_name}')
 
-        # Clear campaign-specific DNC before uploading
-        dnc_cleared = 0
+        # Check DNC status (read-only, no clearing)
+        on_dnc = 0
         for lead in cm_info['leads']:
             if not lead['phone']:
                 continue
@@ -214,21 +241,16 @@ def upload_all(summary):
                 dnc_entries = dnc_entries.get('entries', [])
             for entry in (dnc_entries or []):
                 if str(entry.get('campaign_id', '')) == campaign_id:
-                    convoso_post('/v1/dnc/delete', {
-                        'phone_number': lead['phone'],
-                        'phone_code': '1',
-                        'campaign_id': campaign_id,
-                    })
-                    dnc_cleared += 1
-                    log.info(f"DNC cleared: {lead['client_name']} ({lead['phone']}) from campaign {campaign_id}")
+                    on_dnc += 1
+                    log.info(f"On DNC: {lead['client_name']} ({lead['phone']}) in campaign {campaign_id}")
                     break
+        if on_dnc:
+            log.info(f'{cm_name}: {on_dnc} leads on campaign DNC (will not be dialed)')
 
-        if dnc_cleared:
-            log.info(f'{cm_name}: cleared {dnc_cleared} DNC entries')
-
-        # Upload leads
+        # Upload leads — campaign DNC on Convoso side prevents calls
         uploaded = 0
         failed = 0
+        dnc_blocked = 0
         for lead in cm_info['leads']:
             lead_data = {
                 'list_id': list_id,
@@ -245,8 +267,15 @@ def upload_all(summary):
             if r.get('success'):
                 uploaded += 1
             else:
-                failed += 1
-                log.warning(f"Insert failed for {lead['client_name']} ({lead['phone']}): {r.get('text', '')}")
+                err = r.get('text', '') or ''
+                # DNC-blocked inserts aren't real failures — they're already
+                # counted in on_dnc and just won't be dialed.
+                if 'DNC list' in err:
+                    dnc_blocked += 1
+                    log.info(f"DNC-blocked insert for {lead['client_name']} ({lead['phone']}): on DNC, won't be dialed")
+                else:
+                    failed += 1
+                    log.warning(f"Insert failed for {lead['client_name']} ({lead['phone']}): {err}")
 
         results.append({
             'cm': cm_name,
@@ -256,7 +285,8 @@ def upload_all(summary):
             'campaign_id': campaign_id,
             'uploaded': uploaded,
             'failed': failed,
-            'dnc_cleared': dnc_cleared,
+            'dnc_blocked': dnc_blocked,
+            'on_dnc': on_dnc,
             'total': cm_info['count'],
         })
 
@@ -345,15 +375,16 @@ def post_to_asana(summary):
         for r in results:
             if r['status'] == 'uploaded':
                 total_uploaded += r['uploaded']
-                total_dnc += r.get('dnc_cleared', 0)
-                dnc = f", {r.get('dnc_cleared', 0)} DNC cleared" if r.get('dnc_cleared') else ""
+                total_dnc += r.get('on_dnc', 0)
+                dnc = f", {r.get('on_dnc', 0)} on DNC" if r.get('on_dnc') else ""
                 fail = f", {r['failed']} failed" if r['failed'] else ""
                 lines.append(f"  {r['cm']}: {r['uploaded']} uploaded to list {r['list_id']}{dnc}{fail}")
             elif r['status'] == 'skipped':
                 lines.append(f"  {r['cm']}: skipped ({r['reason']})")
             elif r['status'] == 'error':
                 lines.append(f"  {r['cm']}: ERROR - {r['reason']}")
-        lines.append(f"\nTotal: {total_uploaded} leads, {total_dnc} DNC cleared")
+        dnc_line = f", {total_dnc} on DNC (won't be dialed)" if total_dnc else ""
+        lines.append(f"\nTotal: {total_uploaded} leads{dnc_line}")
 
     # Activation results
     activation = summary.get('activation', [])
@@ -390,3 +421,104 @@ def post_to_asana(summary):
     except Exception as e:
         log.error(f"Asana error: {e}")
         return None
+
+
+# ── DNC across all CM campaigns ───────────────────────────────────────────
+
+def dnc_all_cm(phone):
+    """Add a phone number to DNC on ALL CM campaigns."""
+    phone = clean_phone(phone)
+    if not phone:
+        return {'success': False, 'error': 'Invalid phone number'}
+
+    added = []
+    already = []
+    failed = []
+
+    for cm_name, campaign_id in CM_CAMPAIGNS.items():
+        # Check if already on DNC for this campaign
+        resp = convoso_post('/v1/dnc/search', {
+            'phone_number': phone,
+            'phone_code': '1',
+        })
+        dnc_entries = resp.get('data', [])
+        if isinstance(dnc_entries, dict):
+            dnc_entries = dnc_entries.get('entries', [])
+
+        already_on = any(
+            str(e.get('campaign_id', '')) == campaign_id
+            for e in (dnc_entries or [])
+        )
+
+        if already_on:
+            already.append(cm_name)
+            continue
+
+        r = convoso_post('/v1/dnc/insert', {
+            'phone_number': phone,
+            'phone_code': '1',
+            'campaign_id': campaign_id,
+        })
+        if r.get('success'):
+            added.append(cm_name)
+            log.info(f"DNC added: {phone} → campaign {campaign_id} ({cm_name})")
+        else:
+            failed.append(cm_name)
+            log.warning(f"DNC insert failed: {phone} → campaign {campaign_id}: {r.get('text', '')}")
+
+    return {
+        'success': True,
+        'phone': phone,
+        'added': added,
+        'already': already,
+        'failed': failed,
+    }
+
+
+def undnc_all_cm(phone):
+    """Remove a phone number from DNC on ALL CM campaigns."""
+    phone = clean_phone(phone)
+    if not phone:
+        return {'success': False, 'error': 'Invalid phone number'}
+
+    removed = []
+    not_found = []
+    failed = []
+
+    for cm_name, campaign_id in CM_CAMPAIGNS.items():
+        resp = convoso_post('/v1/dnc/search', {
+            'phone_number': phone,
+            'phone_code': '1',
+        })
+        dnc_entries = resp.get('data', [])
+        if isinstance(dnc_entries, dict):
+            dnc_entries = dnc_entries.get('entries', [])
+
+        on_this = any(
+            str(e.get('campaign_id', '')) == campaign_id
+            for e in (dnc_entries or [])
+        )
+
+        if not on_this:
+            not_found.append(cm_name)
+            continue
+
+        r = convoso_post('/v1/dnc/delete', {
+            'phone_number': phone,
+            'phone_code': '1',
+            'campaign_id': campaign_id,
+        })
+        if r.get('success'):
+            removed.append(cm_name)
+            log.info(f"DNC removed: {phone} from campaign {campaign_id} ({cm_name})")
+        else:
+            failed.append(cm_name)
+            log.warning(f"DNC delete failed: {phone} from campaign {campaign_id}: {r.get('text', '')}")
+
+    return {
+        'success': True,
+        'phone': phone,
+        'removed': removed,
+        'not_found': not_found,
+        'failed': failed,
+    }

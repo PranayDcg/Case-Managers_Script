@@ -4,3 +4,13 @@ __pycache__/
 *.lock
 slack_processed.json
 .env
+
+# CM Salesforce sync: runtime state, client data and secrets never go in this (public) repo
+cm_sync/.env
+cm_sync/state.json
+cm_sync/state.tmp
+cm_sync/changes.csv
+cm_sync/APPLY_VERIFIED
+cm_sync/logs/
+cm_sync/one_lead_test.py
+*.csv

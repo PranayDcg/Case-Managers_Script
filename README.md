@@ -1,5 +1,9 @@
 # CM Weekly Upload Automation
 
+> **Update 2026-10-27: the weekly file upload is replaced by the daily Salesforce sync in [`cm_sync/`](cm_sync/README.md).**
+> Case managers' campaigns now follow Salesforce every weekday (5 PM plan with Sync / Reject buttons, auto-sync at 6 PM).
+> The file-drop bot below still runs for `dnc` / `undnc` and as a fallback.
+
 Slack-driven automation for uploading weekly Case Manager lead lists to the Convoso dialer. A bot watches a Slack channel for file drops, parses the spreadsheet, uploads leads to the correct campaigns, and activates new lists on a schedule -- all with interactive confirmation steps.
 
 ## How It Works
@@ -16,7 +20,7 @@ Slack-driven automation for uploading weekly Case Manager lead lists to the Conv
 |---------------------|-------------|
 | Alondra Alva        | 4135        |
 | Alquinton Smith     | 4999        |
-| Asmeri Mix          | 4997        |
+| Kalyssa Acosta      | 4997        |
 | Darrell Fair        | 4985        |
 | Maximiliano Muller  | 4991        |
 | Eli Paredes         | 5003        |
@@ -34,7 +38,11 @@ The input file (xlsx or csv) must have these columns in order:
 |------------|--------------|----------------|------------|
 | File Number | Client Name | Case Manager   | Cell Phone |
 
-The Case Manager column value must match a key in `CM_CAMPAIGNS` (case-sensitive).
+The Case Manager column value must match a key in `CM_CAMPAIGNS`. Matching is
+**case-insensitive and whitespace-tolerant** (via `campaign_for_cm()` / `_norm_cm()`):
+`Stefan Rivera`, `stefan rivera`, and `Stefan  Rivera` all map to the same campaign.
+The name still has to be the same name — a different spelling (e.g. `Riveira`) won't match
+and the CM is reported as `*NO CAMPAIGN*`.
 
 ## Custom Fields
 

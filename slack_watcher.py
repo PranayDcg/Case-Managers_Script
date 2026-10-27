@@ -4,7 +4,7 @@ Polls a Slack channel for file drops and commands.
 Flow: file drop → summary → proceed → upload → activate
 """
 
-import os, sys, re, json, time, logging, signal
+import msvcrt, os, sys, re, json, time, logging, signal
 from pathlib import Path
 from datetime import datetime
 
@@ -85,33 +85,44 @@ def save_processed(processed):
 
 # ── Lock file (singleton) ──────────────────────────────────────────────────
 
+_lock_fh = None
+
 def check_lock():
-    if LOCK_FILE.exists():
-        try:
-            old_pid = int(LOCK_FILE.read_text().strip())
-            # Check if PID is alive (Windows)
-            import subprocess
-            result = subprocess.run(
-                ['tasklist', '/FI', f'PID eq {old_pid}'],
-                capture_output=True, text=True, timeout=5
-            )
-            if str(old_pid) in result.stdout:
-                log.error(f"Another watcher is running (PID {old_pid}). Exiting.")
-                sys.exit(1)
-        except (ValueError, subprocess.TimeoutExpired):
-            pass
-    # Write our PID with double-check
-    LOCK_FILE.write_text(str(os.getpid()))
-    time.sleep(1)
-    written_pid = int(LOCK_FILE.read_text().strip())
-    if written_pid != os.getpid():
-        log.error(f"Lock race lost to PID {written_pid}. Exiting.")
+    """Acquire an OS-level file lock via msvcrt. Cannot be raced — Windows
+    enforces exclusivity at the kernel level. Lock auto-releases if the
+    process crashes. Locks byte 64 so PID at byte 0 stays readable by
+    monitoring tools (Agent Savva)."""
+    global _lock_fh
+    try:
+        # Open read/write WITHOUT truncating (create if missing). The byte-64
+        # lock must be acquired BEFORE we touch the PID bytes — otherwise a
+        # duplicate launch that loses the race would still truncate the file
+        # and clobber the real holder's PID, making monitors think we're down.
+        fd = os.open(LOCK_FILE, os.O_RDWR | os.O_CREAT)
+        _lock_fh = os.fdopen(fd, 'r+')
+        _lock_fh.seek(64)
+        msvcrt.locking(_lock_fh.fileno(), msvcrt.LK_NBLCK, 1)
+    except (IOError, OSError):
+        if _lock_fh:
+            _lock_fh.close()
+            _lock_fh = None
+        log.error("Another watcher is already running. Exiting.")
         sys.exit(1)
+    # Got the lock — now it's safe to record our PID at byte 0.
+    _lock_fh.seek(0)
+    _lock_fh.truncate()
+    _lock_fh.write(str(os.getpid()))
+    _lock_fh.flush()
     log.info(f"Lock acquired (PID {os.getpid()})")
 
 def cleanup_lock():
+    """Release the OS-level file lock and delete the lock file."""
+    global _lock_fh
     try:
-        if LOCK_FILE.exists() and int(LOCK_FILE.read_text().strip()) == os.getpid():
+        if _lock_fh:
+            _lock_fh.close()
+            _lock_fh = None
+        if LOCK_FILE.exists():
             LOCK_FILE.unlink()
     except Exception:
         pass
@@ -176,7 +187,7 @@ def format_upload_result(summary):
         if r['status'] == 'uploaded':
             uploaded_count += 1
             total_leads += r['uploaded']
-            dnc_note = f", {r.get('dnc_cleared', 0)} DNC cleared" if r.get('dnc_cleared') else ""
+            dnc_note = f", {r.get('on_dnc', 0)} on DNC" if r.get('on_dnc') else ""
             fail_note = f" ({r['failed']} failed)" if r['failed'] else ""
             lines.append(f"  {r['cm']:25s} — {r['uploaded']} uploaded to list {r['list_id']} (inactive){dnc_note}{fail_note}")
         elif r['status'] == 'skipped':
@@ -203,15 +214,16 @@ def format_activation(summary):
 
 # ── Command handlers ────────────────────────────────────────────────────────
 
-def handle_file(file_info):
+def handle_file(file_info, uploader=''):
     global pending_summary, session_state
 
+    tag = f"<@{uploader}> " if uploader else ""
     url = file_info.get('url_private_download') or file_info.get('url_private')
     name = file_info.get('name', 'unknown')
     ext = Path(name).suffix.lower()
 
     if ext not in ('.xlsx', '.csv'):
-        post_message(f"Unsupported file type `{ext}`. Please upload `.xlsx` or `.csv`.")
+        post_message(f"{tag}Unsupported file type `{ext}`. Please upload `.xlsx` or `.csv`.")
         return
 
     post_message(f"Received `{name}` — parsing...")
@@ -225,7 +237,7 @@ def handle_file(file_info):
     try:
         summary = cm_upload.parse_file(dest)
     except Exception as e:
-        post_message(f"Error parsing file: {e}")
+        post_message(f"{tag}Error parsing `{name}`. Please check the file format and re-upload.")
         log.error(f"Parse error: {e}")
         return
 
@@ -237,10 +249,13 @@ def handle_file(file_info):
 def handle_proceed():
     global pending_summary, session_state, auto_activate_time
 
+    if session_state == 'uploading':
+        return  # Already uploading, ignore duplicate
     if session_state != 'pending' or not pending_summary:
         post_message("Nothing to proceed with. Drop a file first.")
         return
 
+    session_state = 'uploading'
     post_message("Uploading leads to Convoso... this may take a minute.")
 
     import cm_upload
@@ -282,11 +297,14 @@ def handle_cancel():
 def handle_activate(auto=False):
     global pending_summary, session_state, auto_activate_time
 
+    if session_state == 'activating':
+        return  # Already activating, ignore duplicate
     if session_state != 'uploaded' or not pending_summary:
         if not auto:
             post_message("Nothing to activate. Upload leads first with `proceed`.")
         return
 
+    session_state = 'activating'
     source = "Auto-activating" if auto else "Activating"
     post_message(f"{source} new lists and deactivating old ones...")
 
@@ -326,6 +344,42 @@ def handle_status():
         uploaded = sum(1 for r in pending_summary.get('results', []) if r['status'] == 'uploaded')
         timer = f" Auto-activates at {auto_activate_time.strftime('%I:%M %p')}." if auto_activate_time else ""
         post_message(f"Uploaded to {uploaded} campaigns. Waiting for `activate`.{timer}")
+
+
+def handle_dnc(phone):
+    """Add phone to DNC on all CM campaigns."""
+    import cm_upload
+    result = cm_upload.dnc_all_cm(phone)
+    if not result['success']:
+        post_message(f"DNC failed: {result['error']}")
+        return
+    lines = [f"*DNC Added* — {result['phone']}"]
+    if result['added']:
+        lines.append(f"  Added to: {', '.join(result['added'])}")
+    if result['already']:
+        lines.append(f"  Already on DNC: {', '.join(result['already'])}")
+    if result['failed']:
+        lines.append(f"  Failed: {', '.join(result['failed'])}")
+    lines.append(f"\n_{len(result['added'])} added, {len(result['already'])} already blocked, {len(result['failed'])} failed_")
+    post_message('\n'.join(lines))
+
+
+def handle_undnc(phone):
+    """Remove phone from DNC on all CM campaigns."""
+    import cm_upload
+    result = cm_upload.undnc_all_cm(phone)
+    if not result['success']:
+        post_message(f"UnDNC failed: {result['error']}")
+        return
+    lines = [f"*DNC Removed* — {result['phone']}"]
+    if result['removed']:
+        lines.append(f"  Removed from: {', '.join(result['removed'])}")
+    if result['not_found']:
+        lines.append(f"  Not on DNC: {', '.join(result['not_found'])}")
+    if result['failed']:
+        lines.append(f"  Failed: {', '.join(result['failed'])}")
+    lines.append(f"\n_{len(result['removed'])} removed, {len(result['not_found'])} not found, {len(result['failed'])} failed_")
+    post_message('\n'.join(lines))
 
 
 # ── Main loop ───────────────────────────────────────────────────────────────
@@ -389,11 +443,19 @@ def main():
                     # Handle file uploads
                     if files:
                         for f in files:
+                            fid = f.get('id', '')
+                            if fid and fid in processed:
+                                log.info(f"Skipping already-processed file {fid}")
+                                continue
                             try:
-                                handle_file(f)
+                                handle_file(f, msg.get('user', ''))
                             except Exception as e:
                                 log.error(f"Error processing file: {e}")
-                                post_message(f"Error processing file: {e}")
+                                uploader = msg.get('user', '')
+                                tag = f"<@{uploader}> " if uploader else ""
+                                post_message(f"{tag}Error processing file. Please check the file format and re-upload.")
+                            if fid:
+                                processed.add(fid)
                         processed.add(ts)
                         save_processed(processed)
 
@@ -416,6 +478,20 @@ def main():
                                 post_message(f"Error: {e}")
                         elif lower == 'status':
                             handle_status()
+                        elif lower.startswith('dnc '):
+                            phone = text.strip()[4:]  # everything after "dnc "
+                            try:
+                                handle_dnc(phone)
+                            except Exception as e:
+                                log.error(f"DNC error: {e}")
+                                post_message(f"Error: {e}")
+                        elif lower.startswith('undnc '):
+                            phone = text.strip()[6:]  # everything after "undnc "
+                            try:
+                                handle_undnc(phone)
+                            except Exception as e:
+                                log.error(f"UnDNC error: {e}")
+                                post_message(f"Error: {e}")
 
                         processed.add(ts)
                         save_processed(processed)

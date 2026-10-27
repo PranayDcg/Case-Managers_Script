@@ -1,0 +1,64 @@
+{
+  "_comment": "SF case-manager USER ID -> Convoso CM campaign id. Map by id, never by name. retired=true means the campaign still exists but the CM no longer takes clients (leads there get moved or removed). Source: PRD T-0012 + live CM_CAMPAIGNS in Convoso/cm/cm_upload.py (read 2026-10-27).",
+  "cms": {
+    "005Pe00000EwucsIAB": {
+      "name": "Alondra Alva",
+      "campaign_id": "4135"
+    },
+    "005Pe00000EvTd7IAF": {
+      "name": "Alquinton Smith",
+      "campaign_id": "4999"
+    },
+    "005Pe00000EvKpxIAF": {
+      "name": "Eli Paredes",
+      "campaign_id": "5003"
+    },
+    "005Pe00000PzZgnIAF": {
+      "name": "Joshua Cardenas",
+      "campaign_id": "6269"
+    },
+    "005Pe00000MBrfSIAT": {
+      "name": "Maximiliano Muller",
+      "campaign_id": "4991"
+    },
+    "005Pe00000EvSltIAF": {
+      "name": "Patricia Tercier",
+      "campaign_id": "5007"
+    },
+    "005Pe00000Ewsw3IAB": {
+      "name": "Sammaurae Barr",
+      "campaign_id": "4993"
+    },
+    "005Pe00000OruO2IAJ": {
+      "name": "Stefan Rivera",
+      "campaign_id": "6181"
+    },
+    "005Pe00000EvSvZIAV": {
+      "name": "Wanicka Cassagnol",
+      "campaign_id": "4995"
+    },
+    "005Pe00000UXhEbIAL": {
+      "name": "Kalyssa Acosta",
+      "campaign_id": "4997"
+    },
+    "005Pe00000Tz3ptIAB": {
+      "name": "Ebonee Wright",
+      "campaign_id": "6871",
+      "note": "active SF user"
+    },
+    "005Pe00000FkuEfIAJ": {
+      "name": "Ebonee Wright",
+      "campaign_id": "6871",
+      "note": "old inactive SF user, same person"
+    },
+    "005Pe00000GsEUbIAN": {
+      "name": "Darrell Fair",
+      "campaign_id": "4985",
+      "retired": true,
+      "note": "inactive SF user"
+    }
+  },
+  "ignore": {
+    "005Pe00000GtpiDIAR": "Adarsha Yemparala: test account (Pranay, 2026-10-27). Skipped silently, never routed or flagged."
+  }
+}
