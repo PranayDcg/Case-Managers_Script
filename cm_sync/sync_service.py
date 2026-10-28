@@ -2,9 +2,9 @@
 CM Salesforce sync service: keeps every case manager's Convoso campaign matching Salesforce.
 
 Weekdays only (Mon-Fri):
-  4:30 PM  posts a preview of today's changes in #cm-uploads (no changes made)
-  5:00 PM  runs the sync. If it would change more than MAX_CHANGES leads, it waits for `sync proceed`.
-Everything is posted in #cm-uploads, logged to logs/, and every applied change goes in changes.csv.
+  5:00 PM  posts ONE message in #cm-uploads with the plan and Sync / Reject buttons. That same message is edited
+           as it goes (ready -> syncing -> done), so the channel gets one clean message a day. 6:00 PM = syncs by itself.
+Issues go to the Savva team (no thread replies). Logged to logs/; every applied change goes in changes.csv.
 
 Slack commands (all start with "sync", so they never collide with the CM upload bot's commands):
   sync help | sync status | sync preview | sync now | sync proceed | sync cancel
@@ -35,7 +35,7 @@ PARENT_ENV = HERE.parent / '.env'             # Asana token (shared by the fleet
 ASANA_EPIC_CM_GID = '1213813165374346'        # same epic the weekly CM upload reports go to
 ASANA_USER_GID = '1210889312062695'           # Pranay
 
-PREVIEW_AT = (16, 30)
+PREVIEW_AT = (16, 30)          # unused since 2026-10-28 (no scheduled preview); `sync preview` still works
 RUN_AT = (17, 0)
 CATCH_UP_UNTIL = (19, 0)
 AUTO_SYNC_AT = (18, 0)        # if nobody presses Sync or Reject, the 5 PM plan syncs by itself at 6 PM
@@ -112,18 +112,30 @@ def slack(method, payload=None, get=False):
     return {'ok': False}
 
 
-def say_buttons(text, buttons):
-    """One message with Slack buttons (when Socket Mode is up). buttons = [(label, action_id, style)].
-    Falls back to plain text + typed-command hint when buttons are off."""
-    if not buttons_on.is_set():
-        return say(text)
-    head = text if len(text) <= 2900 else text[:2900] + '\n…(full list in the thread)'
-    blocks = [{'type': 'section', 'text': {'type': 'mrkdwn', 'text': head}},
-              {'type': 'actions', 'elements': [
-                  {'type': 'button', 'text': {'type': 'plain_text', 'text': lab}, 'action_id': aid, 'value': aid,
-                   **({'style': st} if st else {})} for lab, aid, st in buttons]}]
-    r = slack('chat.postMessage', {'channel': CHANNEL, 'text': text[:3000], 'blocks': blocks})
-    return r.get('ts')
+def board(body, footer='', buttons=(), new=False):
+    """The ONE message of a sync run. new=True posts it; later calls edit that same message (ready -> syncing -> done),
+    so the channel gets one clean message per day instead of one per step. buttons = [(label, action_id, style)]."""
+    if not buttons_on.is_set() and buttons:
+        hint = {'cm_sync_proceed': '`sync proceed`', 'cm_sync_cancel': '`sync cancel`', 'cm_sync_stop': '`sync stop`'}
+        footer += '\nType ' + ' or '.join(hint[a] for _, a, _ in buttons) + '.'
+        buttons = ()
+    with lock:
+        state['board_body'] = body
+        ts = None if new else state.get('board_ts')
+    text = body + ('\n' + footer if footer else '')
+    blocks = [{'type': 'section', 'text': {'type': 'mrkdwn', 'text': text[:2990]}}]
+    if buttons:
+        blocks.append({'type': 'actions', 'elements': [
+            {'type': 'button', 'text': {'type': 'plain_text', 'text': lab}, 'action_id': aid, 'value': aid,
+             **({'style': st} if st else {})} for lab, aid, st in buttons]})
+    p = {'channel': CHANNEL, 'text': text[:3000], 'blocks': blocks}
+    r = slack('chat.update', {**p, 'ts': ts}) if ts else {}
+    if not r.get('ok'):
+        r = slack('chat.postMessage', p)
+    with lock:
+        state['board_ts'] = r.get('ts') or ts
+        save_state()
+    return state['board_ts']
 
 
 def say(text, thread=None):
@@ -174,39 +186,37 @@ def summary_text(title, rows, results=None):
     rows = [r for r in rows if not (r['action'] in S.APPLY_ORDER and r['blocked'])] + \
         [dict(r, action='blocked') for r in rows if r['action'] in S.APPLY_ORDER and r['blocked']]   # QA B10
     t = per_cm_counts(rows)
-    lines = [f'*{title}*', '']
-    for cm in sorted(t, key=str.lower):
+    w = max([len(cm) for cm in t] + [10]) + 2
+    table = []
+    for cm in sorted(t, key=str.lower):          # same aligned look as the old weekly upload summary
         c = t[cm]
-        if not any(c[k] for k in ('new', 'moved in', 'moved out', 'removed', 'phone')):
-            lines.append(f'{cm} — no changes')
-            continue
-        bits = [f"{c['new']} new", f"{c['moved in']} moved in", f"{c['moved out']} moved out", f"{c['removed']} removed"]
-        if c['phone']:
-            bits.append(f"{c['phone']} phone updated")
-        lines.append(f'{cm} — ' + ', '.join(bits))
+        bits = [f'{c[k]} {lab}' for k, lab in (('new', 'new'), ('moved in', 'moved in'), ('moved out', 'moved out'),
+                                                ('removed', 'removed'), ('phone', 'phone updated')) if c[k]]
+        table.append(f"{cm:<{w}}— {', '.join(bits) or 'no changes'}")
+    lines = [f'*{title}*', '```' + '\n'.join(table) + '```']
     tot = Counter(r['action'] for r in rows)
     if results is None:
-        lines += ['──────────────', f"Total: {tot['add']} new · {tot['move']} moved · {tot['remove']} removed"]
+        lines.append(f"*Total:* {tot['add']} new · {tot['move']} moved · {tot['remove']} removed"
+                     + (f" · {tot['update_phone']} phones updated" if tot['update_phone'] else ''))
     else:
         ok = lambda a: results.get(a + '_ok', 0)
         fails = sum(v for k, v in results.items() if k.endswith('_fail'))
-        lines += ['──────────────', f"Done: {ok('add')} new · {ok('move')} moved · {ok('remove')} removed"
-                  + (f" · {ok('update_phone')} phones updated" if ok('update_phone') else '')
-                  + (f' · *{fails} failed*' if fails else ' · 0 failed')]
+        lines.append(f"*Done:* {ok('add')} new · {ok('move')} moved · {ok('remove')} removed"
+                     + (f" · {ok('update_phone')} phones updated" if ok('update_phone') else '')
+                     + (f' · *{fails} failed*' if fails else ''))
         if results.get('stopped_before'):
             lines.append(f"🛑 Stopped by `sync stop`: {results['stopped_before']} changes NOT done")
-    dnc = tot['flag_dnc']
-    if dnc:
-        lines.append(f'🔒 {dnc} on DNC: kept off, as intended')
+    notes = []
+    if tot['flag_dnc']:
+        notes.append(f"🔒 {tot['flag_dnc']} on DNC, kept off")
     people = sum(n for k, n in tot.items() if k.startswith('flag') and k != 'flag_dnc')
     if people:
-        lines.append(f'⚠️ {people} with a wrong or missing phone: not changed')
-    phones = sum(1 for r in rows if r['action'] == 'blocked' and r.get('reason', '').startswith('SF phone differs'))
-    if phones:
-        lines.append(f'📞 {phones} phone numbers differ between Salesforce and Convoso: not changed (report-only)')
-    other = [r for r in rows if r['action'] == 'blocked' and not r.get('reason', '').startswith('SF phone differs')]
+        notes.append(f'⚠️ {people} need a fix in Salesforce (bad or missing phone)')
+    other = [r for r in rows if r['action'] == 'blocked']
     if other:
-        lines.append(f'⚠️ {len(other)} changes blocked: ' + '; '.join(sorted({r["blocked"] for r in other}))[:300])
+        notes.append(f'⚠️ {len(other)} blocked: ' + '; '.join(sorted({r["blocked"] for r in other}))[:200])
+    if notes:
+        lines.append(' · '.join(notes))
     return '\n'.join(lines)
 
 
@@ -391,9 +401,8 @@ def compute(apply):
 def job_preview(label='Preview'):
     rows, _ = compute(apply=False)
     n = len(actionable(rows))
-    title = f"🔎 CM Sync {label} — {datetime.now():%a %m/%d %I:%M %p} (planned, nothing changed yet)"
-    ts = say(summary_text(title, rows) + (f'\n_{n} changes planned. ' + (
-        f'Over {S.MAX_CHANGES}: the run will wait for `sync proceed`._' if n > S.MAX_CHANGES else 'Runs automatically at 5:00 PM._')))
+    title = f"🔎 CM Sync preview · {datetime.now():%a %m/%d %I:%M %p} · nothing changed"
+    say(summary_text(title, rows) + f'\n_{n} changes would be made. The daily sync is at 5:00 PM._')
 
 
 def job_run(trigger, wait_for_buttons=False):
@@ -409,17 +418,14 @@ def job_run(trigger, wait_for_buttons=False):
         say('🛑 Stop received while planning: nothing was changed.')
         _hist(trigger, 'stopped before applying', Counter())
         return
-    todo = actionable(rows)
-    n = len(todo)
-    when = f'{datetime.now():%a %m/%d %I:%M %p}'
+    n = len(actionable(rows))
+    day = f'{datetime.now():%a %m/%d}'
     if n == 0:
-        ts = say(summary_text(f'✅ CM Sync — {when}: everything already matches Salesforce', rows))
+        board(summary_text(f'✅ CM Sync · {day} · Convoso already matches Salesforce', rows), new=True)
         _hist(trigger, 'no changes', Counter())
         return
     if not verified():
-        wait_for_buttons, why = True, 'Live changes are locked (one-lead test), so it will NOT auto-sync. '
-    else:
-        why = ''
+        wait_for_buttons = True
     if wait_for_buttons:
         now = datetime.now()
         auto_at = max(now.replace(hour=AUTO_SYNC_AT[0], minute=AUTO_SYNC_AT[1], second=0, microsecond=0),
@@ -429,15 +435,13 @@ def job_run(trigger, wait_for_buttons=False):
             state['pending'] = {'at': now.isoformat(timespec='seconds'), 'n': n, 'trigger': trigger,
                                 'auto_at': auto_at.isoformat(timespec='seconds') if verified() else ''}
             save_state()
-        text = summary_text(f'⏸️ CM Sync — {when}: ready, nothing changed yet', rows) + '\n' + why
-        if verified():
-            text += f"*Syncs automatically at {auto_at:%I:%M %p}* unless someone rejects it. Details in the thread. "
-        if buttons_on.is_set():
-            ts = say_buttons(text, [('✅ Sync now', 'cm_sync_proceed', 'primary'), ('❌ Reject', 'cm_sync_cancel', 'danger')])
-        else:
-            ts = say(text + 'Type `sync proceed` to sync now or `sync cancel` to reject.')
-        _hist(trigger, f'waiting ({n}), auto at 6 PM', Counter())
+        footer = (f'_Syncs by itself at {auto_at:%I:%M %p} unless someone rejects it._' if verified()
+                  else '_Live changes are locked (one-lead test), so it will NOT sync by itself._')
+        board(summary_text(f'📋 CM Sync · {day} · ready, nothing changed yet', rows), footer,
+              [('✅ Sync now', 'cm_sync_proceed', 'primary'), ('❌ Reject', 'cm_sync_cancel', 'danger')], new=True)
+        _hist(trigger, f'waiting ({n}), auto at {auto_at:%H:%M}', Counter())
         return
+    board(summary_text(f'📋 CM Sync · {day}', rows), new=True)    # `sync now`: no waiting, _apply edits this message
     _apply(rows, cv, trigger)
 
 
@@ -451,8 +455,8 @@ def job_run_scheduled(trigger):
 def _apply(rows, cv, trigger):
     run_id = datetime.now().strftime('%Y%m%d-%H%M%S')
     n = len(actionable(rows))
-    say_buttons(f'▶️ CM Sync applying {n} changes (new and moves first, removals last). Stop it at any time'
-                + (':' if buttons_on.is_set() else ' with `sync stop`.'), [('🛑 Stop', 'cm_sync_stop', 'danger')])
+    board(summary_text(f'⏳ CM Sync · {datetime.now():%a %m/%d} · syncing', rows), f'_{trigger}. Takes a few minutes._',
+          [('🛑 Stop', 'cm_sync_stop', 'danger')])
     global pending_rows
     if not verified():                           # the lock is checked here too (QA criterion 1)
         say('🔒 Live changes are locked until the one-lead test passes. Nothing was changed.')
@@ -471,22 +475,25 @@ def _apply(rows, cv, trigger):
     finally:
         S.ALLOW_WRITES = False
         fh.close()
-    title = f"✅ CM Sync done — {datetime.now():%a %m/%d %I:%M %p}"
+    title = f"✅ CM Sync · {datetime.now():%a %m/%d} · done {datetime.now():%I:%M %p}"
     if results.get('stopped_before'):
-        title = f"🛑 CM Sync STOPPED — {datetime.now():%a %m/%d %I:%M %p}"
+        title = f"🛑 CM Sync · {datetime.now():%a %m/%d} · STOPPED {datetime.now():%I:%M %p}"
     text = summary_text(title, rows, results)
-    url = asana_report(f"CM Sync — {datetime.now():%m/%d/%Y}", text + '\n\n' + attention_text(rows, _failed_lines(run_id))
-                       + '\n\n' + detail_text(rows))
+    url = asana_report(f"CM Sync — {datetime.now():%m/%d/%Y}", text.replace('```', '') + '\n\n'
+                       + attention_text(rows, _failed_lines(run_id)) + '\n\n' + detail_text(rows))
     try:
         sent = send_issues(rows, _failed_lines(run_id))
     except Exception as e:                       # the sync itself worked; never fail the report because of this
         log.error('could not send issues to the Savva team: %s', e)
         sent = -1
+    foot = [f'_{trigger}_']
     if sent > 0:
-        text += f'\n🧑‍🔧 {sent} issue(s) sent to the Savva team to investigate.'
+        foot.append(f'🧑‍🔧 {sent} new issue(s) handed to the Savva team')
     elif sent < 0:
-        text += '\n⚠️ Could not hand the issues to the Savva team (see service.log).'
-    say(text + (f'\n📝 Full list: {url}' if url else ''))
+        foot.append('⚠️ could not hand issues to the Savva team')
+    if url:
+        foot.append(f'<{url}|full list in Asana>')
+    board(text, ' · '.join(foot))
     _hist(trigger, 'stopped' if results.get('stopped_before') else 'applied', results)
 
 
@@ -532,7 +539,7 @@ def run_in_background(fn, *args):
 
 
 # ── commands ───────────────────────────────────────────────────────────────
-HELP = """*CM Sync commands* (Salesforce → Convoso, weekdays: 4:30 PM preview, 5:00 PM plan with Sync / Reject buttons, auto-sync at 6:00 PM)
+HELP = """*CM Sync commands* (Salesforce → Convoso, weekdays: 5:00 PM plan with Sync / Reject buttons, syncs by itself at 6:00 PM)
 `sync status`: last run, next run, paused or not, anything waiting
 `sync preview`: show what a sync would change right now (changes nothing)
 `sync now`: run the sync now (same rules and limits as 5 PM)
@@ -585,14 +592,16 @@ def handle(text, user):
         elif not verified():
             say('🔒 Live changes are still locked until the one-lead test passes. Ask manager savva 2.')
         else:
-            rows = pending_rows
-            if run_in_background(lambda: _apply(rows, S.Convoso(), f'proceed by <@{user}>')):
-                say(f'👍 Approved by <@{user}>.')   # _apply clears the waiting plan once it starts (QA B6)
+            rows = pending_rows                      # _apply edits the day's message and clears the plan (QA B6)
+            run_in_background(lambda: _apply(rows, S.Convoso(), f'Approved by <@{user}>'))
     elif t == 'sync cancel':
         with lock:
             had = state.get('pending'); pending_rows = None; state['pending'] = None; save_state()
-        say(f'❌ Rejected by <@{user}>: nothing was changed and there is no auto-sync today. Type `sync now` to run one anyway.'
-            if had else 'Nothing was waiting.')
+        if had:
+            board(state.get('board_body', '').replace('ready, nothing changed yet', 'rejected'),
+                  f'❌ Rejected by <@{user}>: nothing changed, no auto-sync today. `sync now` runs one anyway.')
+        else:
+            say('Nothing was waiting.')
     elif t == 'sync stop':
         stop_event.set()
         with lock:
@@ -636,14 +645,9 @@ def tick():
     p = state.get('pending')
     if p and p.get('auto_at') and pending_rows is not None and now >= datetime.fromisoformat(p['auto_at']):
         rows = pending_rows
-        say('⏰ Nobody rejected the plan, so CM Sync is syncing it now.')
-        run_in_background(lambda: _apply(rows, S.Convoso(), 'auto-sync (no reject by the deadline)'))
+        run_in_background(lambda: _apply(rows, S.Convoso(), f"Synced by itself at {now:%I:%M %p} (nobody rejected)"))
         return
-    if PREVIEW_AT <= hm < RUN_AT and state.get('last_preview') != today:
-        with lock:
-            state['last_preview'] = today; save_state()
-        run_in_background(job_preview)
-    elif RUN_AT <= hm < CATCH_UP_UNTIL and state.get('last_run') != today:
+    if RUN_AT <= hm < CATCH_UP_UNTIL and state.get('last_run') != today:   # no 4:30 preview any more: one message a day
         tries = state.get('run_tries', {})
         if tries.get(today, 0) >= 3:
             return
@@ -679,13 +683,7 @@ def start_buttons():
             cmd = BUTTON_CMDS.get(act.get('action_id'))
             if not cmd:
                 continue
-            msg = pl.get('message') or {}
-            if cmd != 'sync stop':                         # take the buttons off once someone decided
-                done = {'sync proceed': f'✅ Sync started by <@{user}>', 'sync cancel': f'❌ Rejected by <@{user}>: no sync today'}[cmd]
-                slack('chat.update', {'channel': CHANNEL, 'ts': msg.get('ts'), 'text': (msg.get('text') or '') + '\n' + done,
-                                      'blocks': [b for b in msg.get('blocks', []) if b.get('type') != 'actions'] +
-                                                [{'type': 'context', 'elements': [{'type': 'mrkdwn', 'text': done}]}]})
-            try:
+            try:                                           # handle() edits the day's message (buttons swap themselves)
                 handle(cmd, user)
             except Exception as e:
                 log.error('button %s failed: %s', cmd, e)
@@ -754,8 +752,8 @@ def main():
             say(f"🔄 CM Sync restarted, so the plan that was waiting ({lost.get('n')} changes) was dropped. "
                 'Type `sync now` for a fresh one.')
     if first:
-        say('👋 *CM Sync is on.* From now on the case manager campaigns follow Salesforce: every weekday a preview at '
-            '4:30 PM and the sync at 5:00 PM (weekends skipped). No more file drops needed. Type `sync help` for commands.')
+        say('👋 *CM Sync is on.* The case manager campaigns follow Salesforce: every weekday at 5:00 PM one message with '
+            "the day's changes and Sync / Reject buttons (weekends skipped). Type `sync help` for commands.")
     while True:
         try:
             r = slack('conversations.history', {'channel': CHANNEL, 'limit': '15'}, get=True)

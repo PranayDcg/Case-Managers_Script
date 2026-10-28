@@ -30,24 +30,32 @@ Kalyssa's new clients missing. Case managers get reassigned about 130 times a we
 | **Weekends** | Skipped |
 
 ## 3. What happens every weekday
-| Time | What | In `#cm-uploads` |
+**One message a day.** The 5 PM message is edited in place as the day goes on (ready → syncing → done), in the same
+aligned per-CM layout the old weekly upload used. No preview post, no "approved" or "applying" posts, no thread.
+
+| Time | What | The one message in `#cm-uploads` reads |
 |---|---|---|
-| **4:30 PM** | Preview, reads only | "🔎 CM Sync Preview": per CM, plus the list in the thread |
-| **5:00 PM** | Builds today's plan from live SF + Convoso | "⏸️ CM Sync — ready, nothing changed yet" with **✅ Sync now** / **❌ Reject** buttons |
-| until **6:00 PM** | Anyone in the channel can press **Sync now** (runs now) or **Reject** (no sync today) | The buttons get replaced by "Sync started by @x" / "Rejected by @x" |
-| **6:00 PM** | **If nobody rejected, it syncs by itself** | "⏰ Nobody rejected the plan, so CM Sync is syncing it now." |
-| while syncing | New clients first, then moves, then removals. A **🛑 Stop** button stops it after the current lead | "▶️ CM Sync applying N changes…" |
-| when done | Result per case manager, plus an Asana report under the CM epic | "✅ CM Sync done — Eli Paredes — 4 new, 5 moved in, 1 moved out, 1 removed …" |
+| **5:00 PM** | Builds today's plan from live SF + Convoso | "📋 CM Sync · Wed 10/28 · ready, nothing changed yet" + per-CM list + **✅ Sync now** / **❌ Reject** |
+| until **6:00 PM** | Anyone in the channel can press **Sync now** or **Reject** | Reject → "rejected … by @x" (no sync today) |
+| **6:00 PM** | **If nobody rejected, it syncs by itself** | → "⏳ syncing" with a **🛑 Stop** button |
+| when done | New clients first, then moves, then removals. Asana report under the CM epic | → "✅ done 5:22 PM", totals, who approved, issues handed to the Savva team, Asana link |
+
+Example (per-CM lines; zero counts are left out):
+```
+Eli Paredes             — 33 new, 36 moved in, 3 moved out, 1 removed
+Joshua Cardenas         — 3 new, 18 moved in, 1 removed
+```
+`sync preview` still posts a preview on request.
 
 - **PC asleep or off at 5 PM:** it runs when the PC is back (until 7 PM) and still waits at least 30 min for a Reject.
-- **Nothing to change:** "✅ everything already matches Salesforce".
+- **Nothing to change:** "✅ CM Sync · Convoso already matches Salesforce" (no buttons).
 
 ### Issues go to the Savva team, not to Slack
 Messages in `#cm-uploads` have **no thread replies**. After each sync, every client that needs a person (wrong, missing,
 staff or placeholder phone; duplicate deals; failed Convoso writes) is written to
-`savva-team	asks\cm-sync-issues\<date>\issues.md` and handed to **Savva worker 1** as a bus task. The worker writes
+`savva-team\tasks\cm-sync-issues\<date>\issues.md` and handed to **Savva worker 1** as a bus task. The worker writes
 `REPORT.md` (root causes, who fixes what), and manager savva 2 tells Pranay. The same issue is re-sent only after 7 days
-(`_seen.json`). The Slack summary just says "N issue(s) sent to the Savva team". The full list of changes is in the Asana report.
+(`_seen.json`). The Slack message just says "N new issue(s) handed to the Savva team". The full list of changes is in the Asana report.
 
 ### Reading the summary
 | Line | Meaning |
@@ -80,7 +88,7 @@ All commands start with `sync`, so they never trigger the old CM upload bot (`pr
 |---|---|---|
 | SF or Convoso unreachable / login fails | Stops before changing anything; retries every 20 min until 7 PM (3 tries) | `#cm-uploads` "❌ CM Sync failed … nothing was changed" |
 | Incomplete read, or counts drop under 60% of the last run | Plan refused (this stops wrong mass removals) | `#cm-uploads` "sanity check failed" |
-| One lead fails | That lead is skipped, the rest continue. A write is never retried, so no duplicates | Summary "· N failed", names in the thread |
+| One lead fails | That lead is skipped, the rest continue. A write is never retried, so no duplicates | Message shows "N failed"; names go to the Savva team and the Asana report |
 | Someone spots a problem | 🛑 Stop / `sync stop` | `#cm-uploads` |
 | Bot crashes | The restart loop brings it back in 15 s; Windows Startup brings it back after a reboot | If a plan was waiting, it is rebuilt and reposted |
 | **Bot down, stuck, or no 5 PM post** | **Watchdog** (savva pinger, every minute): restarts it (max 3 an hour); alerts once if stuck for 10 min or if there's no 5 PM plan by 5:20 PM | **Slack DM to Pranay** via Agent Savva |
@@ -159,5 +167,3 @@ Daniela Ortiz (4989) has a Convoso campaign but no clients in SF, so it's not in
 - **Stefan Rivera:** retire his campaign if he has left.
 - **Kalyssa:** rename or replace the legacy Asmeri list as her active list (optional, cosmetic).
 - **Eli / back office:** fix the "needs a person" items in SF (wrong, missing or duplicate numbers), plus the 4 placeholder mobiles.
-- **Slack thread is long** (one line per change, split over many messages). Planned: a short "needs a person" message plus one file
-  (needs the `files:write` scope on the CM bot app). DNC to become an info line, not a warning.
