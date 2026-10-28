@@ -92,7 +92,14 @@ def save_state():
         state['history'] = state['history'][-60:]
         tmp = STATE_FILE.with_suffix('.tmp')
         tmp.write_text(json.dumps(state, indent=1), encoding='utf-8')
-        os.replace(tmp, STATE_FILE)
+        for attempt in range(5):                  # Windows refuses the swap while another process is reading the file
+            try:
+                os.replace(tmp, STATE_FILE)
+                break
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.2 * (attempt + 1))
 
 
 state = load_state()
@@ -348,18 +355,22 @@ def send_issues(rows, failed_lines=()):
         seen = json.loads(seen_file.read_text(encoding='utf-8'))
     except Exception:
         seen = {}
-    fresh = []
+    fresh, still_open = [], []
     for e in issues:
-        key = f"{e['file'] or e['client']}|{'|'.join(sorted(e['problems']))}"
+        # key on the KIND of problem only (text before ':'), so a detail such as the other deal's stage changing
+        # doesn't make an old issue look new (T-0032 finding)
+        kinds = sorted({p.split(':')[0].strip() for p in e['problems']})
+        key = f"{e['file'] or e['client']}|{'|'.join(kinds)}"
         last = seen.get(key)
         if last and (datetime.now() - datetime.fromisoformat(last)).days < ISSUE_REPEAT_DAYS:
+            still_open.append(e)
             continue
         seen[key] = today
         fresh.append(e)
     ISSUES_DIR.mkdir(parents=True, exist_ok=True)
     seen_file.write_text(json.dumps({k: v for k, v in seen.items() if (datetime.now() - datetime.fromisoformat(v)).days < 30},
                                     indent=0), encoding='utf-8')
-    if not fresh:
+    if not fresh and not still_open:
         return 0
     day = ISSUES_DIR / today
     day.mkdir(parents=True, exist_ok=True)
@@ -367,8 +378,18 @@ def send_issues(rows, failed_lines=()):
     for i, e in enumerate(fresh, 1):
         md += [f"## {i}. {e['client']} (file {e['file'] or '-'}), CM {e['cm'] or '-'}"] + [f'- **Problem:** {x}' for x in e['problems']] \
               + [f'- {x}' for x in e['context']] + ['']
+    # what is still open from earlier reports (seen before, still failing today) vs fixed (no longer an issue)
+    open_keys = {e['file'] or e['client'] for e in still_open}
+    earlier = sorted({k.split('|')[0] for k, v in seen.items() if v != today})
+    fixed = [k for k in earlier if k not in open_keys and k not in {e['file'] or e['client'] for e in fresh}]
+    md += ['## Earlier issues', f'**Still open: {len(still_open)}** (reported before, still a problem today).']
+    md += [f"- {e['client']} (file {e['file'] or '-'}), CM {e['cm'] or '-'}: " + '; '.join(p.split(':')[0] for p in e['problems'])
+           for e in still_open]
+    md += ['', f'**Fixed since reported: {len(fixed)}** (file numbers no longer flagged): ' + (', '.join(fixed) or 'none'), '']
     (day / 'issues.md').write_text('\n'.join(md), encoding='utf-8')
     (day / 'issues.json').write_text(json.dumps(fresh, indent=1), encoding='utf-8')
+    if not fresh:                                 # nothing new: the file still records what is open/fixed, no worker task
+        return 0
     sys.path.insert(0, str(SAVVA / 'bus'))
     from savva_bus import Bus
     tid, target = Bus().post_task('manager savva 2', 'convoso', f'CM sync issues {today}: {len(fresh)} client(s)',
